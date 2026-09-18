@@ -159,6 +159,39 @@ struct DownloadProgressTests {
         }
     }
 
+    @Test(arguments: [false, true])
+    func largeSingleTermReportsOnlyCompletion(writeToDisk: Bool) async throws {
+        let xorb = StreamedXorbFixture()
+        try await withFixture(
+            hashes: ["a"],
+            unpackedLength: UInt32(xorb.output.count),
+            streamedXorb: xorb
+        ) { downloader, requests in
+            let progress = ProgressRecorder()
+            let record: @Sendable (Int64, Int64) -> Void = { completed, total in
+                // Decoded chunks do not count until the complete term is written.
+                #expect(requests.sentChunks == xorb.chunks.count)
+                progress.record(completed, total)
+            }
+            let output: Data
+            if writeToDisk {
+                let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: destination) }
+                let written = try await downloader.download(Self.fileID, to: destination, progress: record)
+                #expect(written == Int64(xorb.output.count))
+                output = try Data(contentsOf: destination)
+            } else {
+                output = try await downloader.data(for: Self.fileID, progress: record)
+            }
+
+            #expect(output == xorb.output)
+            #expect(requests.count(for: "/a") == 1)
+            #expect(requests.sentChunks == 128)
+            let expectedBytes: Int64 = 8 * 1024 * 1024
+            #expect(progress.values == [.init(completed: expectedBytes, total: expectedBytes)])
+        }
+    }
+
     @Test func cancellationWhileWaitingForFetchDoesNotComplete() async throws {
         try await withFixture(delayB: .seconds(2)) { downloader, requests in
             let progress = ProgressRecorder()
@@ -246,15 +279,42 @@ private final class ProgressRecorder: @unchecked Sendable {
 private final class RequestRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var paths: [String: Int] = [:]
+    private var chunkCount = 0
 
     var total: Int { lock.withLock { paths.values.reduce(0, +) } }
+    var sentChunks: Int { lock.withLock { chunkCount } }
     func count(for path: String) -> Int { lock.withLock { paths[path, default: 0] } }
+
+    func recordChunk() {
+        lock.withLock { chunkCount += 1 }
+    }
 
     func record(_ path: String) -> Int {
         lock.withLock {
             paths[path, default: 0] += 1
             return paths[path, default: 0]
         }
+    }
+}
+
+/// An 8 MiB term containing 128 distinct, uncompressed 64 KiB chunks.
+private struct StreamedXorbFixture: Sendable {
+    let chunks: [Data]
+    let output: Data
+
+    var encodedByteCount: Int { chunks.reduce(0) { $0 + $1.count } }
+
+    init() {
+        var chunks: [Data] = []
+        var output = Data()
+        for index in 0 ..< 128 {
+            let payload = Data(repeating: UInt8(index), count: 64 * 1024)
+            // Both 24-bit length fields contain 65536, in little-endian order.
+            chunks.append(Data([0, 0, 0, 1, 0, 0, 0, 1]) + payload)
+            output.append(payload)
+        }
+        self.chunks = chunks
+        self.output = output
     }
 }
 
@@ -268,6 +328,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
     private let unpackedLength: UInt32
     private let failFirstB: Bool
     private let delayB: TimeAmount
+    private let streamedXorb: StreamedXorbFixture?
     private let requests: RequestRecorder
 
     init(
@@ -276,6 +337,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         unpackedLength: UInt32,
         failFirstB: Bool,
         delayB: TimeAmount,
+        streamedXorb: StreamedXorbFixture?,
         requests: RequestRecorder
     ) {
         self.hashes = hashes
@@ -283,12 +345,18 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         self.unpackedLength = unpackedLength
         self.failFirstB = failFirstB
         self.delayB = delayB
+        self.streamedXorb = streamedXorb
         self.requests = requests
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         guard case .head(let request) = unwrapInboundIn(data) else { return }
         let attempt = requests.record(request.uri)
+        if request.uri == "/a", let streamedXorb {
+            #expect(request.headers.first(name: "Range") == "bytes=0-\(streamedXorb.encodedByteCount - 1)")
+            send(streamedXorb, context: context)
+            return
+        }
         let base = "http://127.0.0.1:\(context.channel.localAddress!.port!)"
         var status = HTTPResponseStatus.ok
         let body: Data
@@ -299,12 +367,14 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
                 """.utf8
             )
         } else if request.uri.hasPrefix("/v1/reconstructions/") {
+            let chunkRange = 0 ..< (streamedXorb?.chunks.count ?? 1)
+            let urlRange: ClosedRange<UInt64> = 0 ... UInt64((streamedXorb?.encodedByteCount ?? 12) - 1)
             let reconstruction = CASClient.ReconstructionResponse(
                 offsetIntoFirstRange: offset,
-                terms: hashes.map { .init(hash: $0, unpackedLength: unpackedLength, range: 0 ..< 1) },
+                terms: hashes.map { .init(hash: $0, unpackedLength: unpackedLength, range: chunkRange) },
                 fetchInfo: Dictionary(
                     uniqueKeysWithValues: Set(hashes).map {
-                        ($0, [.init(url: "\(base)/\($0)", range: 0 ..< 1, urlRange: 0 ... 11)])
+                        ($0, [.init(url: "\(base)/\($0)", range: chunkRange, urlRange: urlRange)])
                     }
                 )
             )
@@ -331,6 +401,35 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
             context.writeAndFlush(NIOAny(HTTPServerResponsePart.end(nil)), promise: nil)
         }
     }
+
+    private func send(_ xorb: StreamedXorbFixture, context: ChannelHandlerContext) {
+        let head = HTTPResponseHead(
+            version: .http1_1,
+            status: .partialContent,
+            headers: HTTPHeaders([
+                ("Content-Length", "\(xorb.encodedByteCount)"),
+                ("Content-Range", "bytes 0-\(xorb.encodedByteCount - 1)/\(xorb.encodedByteCount)"),
+            ])
+        )
+        context.writeAndFlush(NIOAny(HTTPServerResponsePart.head(head)), promise: nil)
+        let boundContext = NIOLoopBound(context, eventLoop: context.eventLoop)
+        let requests = self.requests
+        for (index, chunk) in xorb.chunks.enumerated() {
+            // Spread the response over more than six progress reporting intervals.
+            context.eventLoop.scheduleTask(in: .milliseconds(Int64(index) * 5)) {
+                let context = boundContext.value
+                guard context.channel.isActive else { return }
+                requests.recordChunk()
+                context.writeAndFlush(
+                    NIOAny(HTTPServerResponsePart.body(.byteBuffer(ByteBuffer(bytes: chunk)))),
+                    promise: nil
+                )
+                if index == xorb.chunks.count - 1 {
+                    context.writeAndFlush(NIOAny(HTTPServerResponsePart.end(nil)), promise: nil)
+                }
+            }
+        }
+    }
 }
 
 private func withFixture(
@@ -339,6 +438,7 @@ private func withFixture(
     unpackedLength: UInt32 = 4,
     failFirstB: Bool = false,
     delayB: TimeAmount = .nanoseconds(0),
+    streamedXorb: StreamedXorbFixture? = nil,
     _ body: (XetDownloader, RequestRecorder) async throws -> Void
 ) async throws {
     let requests = RequestRecorder()
@@ -353,6 +453,7 @@ private func withFixture(
                         unpackedLength: unpackedLength,
                         failFirstB: failFirstB,
                         delayB: delayB,
+                        streamedXorb: streamedXorb,
                         requests: requests
                     )
                 )

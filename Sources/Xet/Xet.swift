@@ -295,6 +295,9 @@ public final class XetDownloader: @unchecked Sendable {
     /// at most once every 100 milliseconds.
     /// The first intermediate update and the final update bypass this interval.
     /// Short downloads may report only the final update.
+    /// A file reconstructed from one term reports only the final update,
+    /// regardless of its size.
+    /// No updates occur while that term downloads and decodes.
     ///
     /// On success, the final callback has equal completed and total counts,
     /// including `(0, 0)` for empty output.

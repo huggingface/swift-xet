@@ -91,6 +91,8 @@ Updates occur after reconstruction terms are written,
 at most once every 100 milliseconds.
 The first intermediate update and the final update bypass this interval.
 Short downloads may report only completion.
+A file reconstructed from one term reports only completion, even if it is large.
+No updates occur while that term downloads and decodes.
 The callback runs on the download task and must return promptly;
 it does not run on a specific actor or queue.
 
