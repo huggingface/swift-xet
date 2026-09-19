@@ -246,11 +246,12 @@ struct DownloadProgressTests {
             let data = try await downloader.data(for: Self.fileID, progress: progress.record)
             #expect(data.count == 2000)
             #expect(requests.count(for: "/a") == 1)
-            #expect(progress.values.last == .init(completed: 2000, total: 2000))
-            let times = progress.times.dropLast()
-            for (earlier, later) in zip(times, times.dropFirst()) {
-                #expect(earlier.duration(to: later) >= .milliseconds(99))
-            }
+            #expect(
+                progress.values == [
+                    .init(completed: 4, total: 2000),
+                    .init(completed: 2000, total: 2000),
+                ]
+            )
         }
     }
 }
@@ -263,15 +264,12 @@ private final class ProgressRecorder: @unchecked Sendable {
 
     private let lock = NSLock()
     private var storage: [Value] = []
-    private var timestamps: [ContinuousClock.Instant] = []
 
     var values: [Value] { lock.withLock { storage } }
-    var times: [ContinuousClock.Instant] { lock.withLock { timestamps } }
 
     func record(_ completed: Int64, _ total: Int64) {
         lock.withLock {
             storage.append(Value(completed: completed, total: total))
-            timestamps.append(.now)
         }
     }
 }
