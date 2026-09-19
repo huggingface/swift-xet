@@ -68,6 +68,40 @@ try await Xet.withDownloader(
 }
 ```
 
+### Download Progress
+
+Both download methods accept an optional `progress` callback:
+
+```swift
+import Foundation
+
+let progress = Progress(totalUnitCount: 0)
+try await downloader.download(fileID, to: destinationURL) { completed, total in
+    progress.totalUnitCount = total
+    progress.completedUnitCount = completed
+}
+```
+
+The counts measure reconstructed output bytes.
+For partial downloads, they include only the requested output.
+Chunk reuse counts each output position once.
+Each call starts a new count, including retries by the caller.
+
+Updates occur after reconstruction terms are written,
+at most once every 100 milliseconds.
+The first intermediate update and the final update bypass this interval.
+Short downloads may report only completion.
+A file reconstructed from one term reports only completion, even if it is large.
+No updates occur while that term downloads and decodes.
+The callback runs on the download task and must return promptly;
+it does not run on a specific actor or queue.
+
+A successful download reports equal completed and total counts,
+including `(0, 0)` for empty output.
+Disk downloads report completion after the file is closed.
+Failed or canceled downloads do not report completion.
+No callbacks occur after the method returns or throws.
+
 ### Partial Downloads
 
 Both methods support partial downloads via the `byteRange` parameter:

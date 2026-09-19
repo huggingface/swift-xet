@@ -244,6 +244,8 @@ public final class XetDownloader: @unchecked Sendable {
     ///     The range is half-open: `start..<end`.
     ///     An empty range (where `lowerBound == upperBound`) returns
     ///     an empty `Data` immediately without making any network requests.
+    ///   - progress: Optional callback with completed and total output bytes.
+    ///     See ``download(_:byteRange:to:fileManager:progress:)`` for its contract.
     ///
     /// - Returns: The file contents, or the requested byte range.
     ///
@@ -253,13 +255,16 @@ public final class XetDownloader: @unchecked Sendable {
     ///   or `URLError` for network failures.
     ///
     /// - Important: This method loads the entire file (or range) into memory.
-    ///   For large files, use ``download(_:byteRange:to:)``
+    ///   For large files, use ``download(_:byteRange:to:fileManager:progress:)``
     ///   to write directly to disk instead.
     public func data(
         for fileID: String,
-        byteRange: Range<UInt64>? = nil
+        byteRange: Range<UInt64>? = nil,
+        progress: (@Sendable (_ completedBytes: Int64, _ totalBytes: Int64) -> Void)? = nil
     ) async throws -> Data {
+        try Task.checkCancellation()
         if let byteRange, byteRange.isEmpty {
+            progress?(0, 0)
             return Data()
         }
         let writer = DataOutputWriter()
@@ -267,12 +272,39 @@ public final class XetDownloader: @unchecked Sendable {
         _ = try await download(
             fileID: fileID,
             byteRange: byteRange,
-            target: target
+            target: target,
+            progress: progress
         )
-        return await writer.data
+        let data = await writer.data
+        try Task.checkCancellation()
+        progress?(Int64(data.count), Int64(data.count))
+        return data
     }
 
     /// Downloads a file and writes it to disk.
+    ///
+    /// Progress counts reconstructed bytes written to the output,
+    /// not compressed network bytes.
+    /// For partial downloads, counts exclude skipped and truncated bytes.
+    /// Reused chunks count once for each position they occupy in the output.
+    ///
+    /// The callback runs synchronously on the download task, without a specific
+    /// actor or queue, and should return promptly.
+    /// Calls are serial within each download.
+    /// Intermediate updates occur after reconstruction terms are written,
+    /// at most once every 100 milliseconds.
+    /// The first intermediate update and the final update bypass this interval.
+    /// Short downloads may report only the final update.
+    /// A file reconstructed from one term reports only the final update,
+    /// regardless of its size.
+    /// No updates occur while that term downloads and decodes.
+    ///
+    /// On success, the final callback has equal completed and total counts,
+    /// including `(0, 0)` for empty output.
+    /// For disk downloads, this occurs after the file is closed.
+    /// Failure or cancellation produces no final update.
+    /// No callbacks occur after the method returns or throws.
+    /// Each new call starts its own count, including retries by the caller.
     ///
     /// - Parameters:
     ///   - fileID: The 64-character hex file identifier (Merkle hash).
@@ -285,6 +317,7 @@ public final class XetDownloader: @unchecked Sendable {
     ///     If a file exists at this path, it will be replaced.
     ///   - fileManager: The file manager to use for file operations.
     ///     Defaults to `.default`.
+    ///   - progress: Optional callback with completed and total output bytes.
     ///
     /// - Returns: The number of bytes written.
     ///
@@ -298,8 +331,10 @@ public final class XetDownloader: @unchecked Sendable {
         _ fileID: String,
         byteRange: Range<UInt64>? = nil,
         to destinationURL: URL,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        progress: (@Sendable (_ completedBytes: Int64, _ totalBytes: Int64) -> Void)? = nil
     ) async throws -> Int64 {
+        try Task.checkCancellation()
         if fileManager.fileExists(atPath: destinationURL.path) {
             try fileManager.removeItem(at: destinationURL)
         }
@@ -308,6 +343,8 @@ public final class XetDownloader: @unchecked Sendable {
         }
 
         if let byteRange, byteRange.isEmpty {
+            try Task.checkCancellation()
+            progress?(0, 0)
             return 0
         }
         let writer = try FileOutputWriter(destinationURL: destinationURL)
@@ -316,9 +353,12 @@ public final class XetDownloader: @unchecked Sendable {
             let written = try await download(
                 fileID: fileID,
                 byteRange: byteRange,
-                target: target
+                target: target,
+                progress: progress
             )
             try await target.closeIfNeeded()
+            try Task.checkCancellation()
+            progress?(written, written)
             return written
         } catch {
             await target.closeIfNeeded(catching: { closeError in
@@ -349,7 +389,8 @@ public final class XetDownloader: @unchecked Sendable {
     private func download(
         fileID: String,
         byteRange: Range<UInt64>?,
-        target: WriteTarget
+        target: WriteTarget,
+        progress: (@Sendable (Int64, Int64) -> Void)?
     ) async throws -> Int64 {
         // Validate file ID
         guard fileID.count == 64,
@@ -362,6 +403,7 @@ public final class XetDownloader: @unchecked Sendable {
             for: refreshURL,
             hubToken: hubToken
         )
+        try Task.checkCancellation()
         // Validate CAS URL uses HTTPS unless insecure connections are allowed
         if !configuration.allowsInsecureConnections && conn.casURL.scheme != "https" {
             throw XetDownloaderError.insecureURL(conn.casURL)
@@ -373,8 +415,24 @@ public final class XetDownloader: @unchecked Sendable {
             accessToken: conn.accessToken,
             byteRange: byteRange
         )
-        let maxBytesToWrite: UInt64? = byteRange.map { UInt64($0.count) }
+        try Task.checkCancellation()
+        let maxBytesToWrite = byteRange.map { $0.upperBound - $0.lowerBound }
         var remainingBytesToWrite = maxBytesToWrite
+
+        var reconstructedBytes: UInt64 = 0
+        for term in reconstruction.terms {
+            let (sum, overflow) = reconstructedBytes.addingReportingOverflow(UInt64(term.unpackedLength))
+            guard !overflow else { throw XetDownloaderError.invalidReconstruction }
+            reconstructedBytes = sum
+        }
+        guard reconstructedBytes >= reconstruction.offsetIntoFirstRange else {
+            throw XetDownloaderError.invalidReconstruction
+        }
+        let availableBytes = reconstructedBytes - reconstruction.offsetIntoFirstRange
+        guard let totalBytes = Int64(exactly: min(availableBytes, maxBytesToWrite ?? availableBytes)) else {
+            throw XetDownloaderError.invalidReconstruction
+        }
+        var lastProgressUpdate: TimeInterval?
 
         var bytesToSkipInFirstTerm = reconstruction.offsetIntoFirstRange
 
@@ -444,6 +502,11 @@ public final class XetDownloader: @unchecked Sendable {
         }
         let fetchSemaphore = AsyncSemaphore(maxConcurrentTasks: maxConcurrentFetches)
         var inflightFetches: [FetchRangeKey: Task<FetchedXorb, Error>] = [:]
+        defer {
+            for task in inflightFetches.values {
+                task.cancel()
+            }
+        }
         let writeRaw = target.writeContentsOf
 
         func termRange(from fetched: FetchedXorb, for term: CASClient.ReconstructionResponse.Term) throws -> Range<Int>
@@ -455,6 +518,9 @@ public final class XetDownloader: @unchecked Sendable {
             }
             let startByte = fetched.chunkByteIndices[startIndex]
             let endByte = fetched.chunkByteIndices[endIndex]
+            guard endByte - startByte == Int(term.unpackedLength) else {
+                throw XetDownloaderError.invalidReconstruction
+            }
             if startByte >= endByte {
                 return startByte ..< startByte
             }
@@ -462,6 +528,7 @@ public final class XetDownloader: @unchecked Sendable {
         }
 
         func writeTermData(base: Data, range: Range<Int>) async throws {
+            try Task.checkCancellation()
             var lower = range.lowerBound
             var upper = range.upperBound
             if lower >= upper {
@@ -507,6 +574,14 @@ public final class XetDownloader: @unchecked Sendable {
             }
 
             totalWritten += Int64(upper - lower)
+            try Task.checkCancellation()
+            if let progress, totalWritten < totalBytes {
+                let now = ProcessInfo.processInfo.systemUptime
+                if lastProgressUpdate.map({ now - $0 >= 0.1 }) ?? true {
+                    lastProgressUpdate = now
+                    progress(totalWritten, totalBytes)
+                }
+            }
         }
 
         func ensureFetchTask(for context: TermContext) {
@@ -525,6 +600,7 @@ public final class XetDownloader: @unchecked Sendable {
             inflightFetches[key] = Task {
                 await fetchSemaphore.wait()
                 do {
+                    try Task.checkCancellation()
                     let fetched = try await fetchXorbChunks(
                         termHash: term.hash,
                         fetchInfo: context.fetchInfo,
@@ -541,6 +617,7 @@ public final class XetDownloader: @unchecked Sendable {
         }
 
         for (termIndex, context) in termContexts.enumerated() {
+            try Task.checkCancellation()
             let term = context.term
             let key = context.key
             if let remainingBytesToWrite, remainingBytesToWrite == 0 {
@@ -563,7 +640,14 @@ public final class XetDownloader: @unchecked Sendable {
                 continue
             }
 
-            let fetchedChunks = try await fetchTask.value
+            let pendingFetches = Array(inflightFetches.values)
+            let fetchedChunks = try await withTaskCancellationHandler {
+                try await fetchTask.value
+            } onCancel: {
+                for task in pendingFetches {
+                    task.cancel()
+                }
+            }
             inflightFetches[key] = nil
 
             if shouldCacheAllForXorb {
@@ -573,6 +657,10 @@ public final class XetDownloader: @unchecked Sendable {
             try await writeTermData(base: fetchedChunks.data, range: range)
         }
 
+        try Task.checkCancellation()
+        guard totalWritten == totalBytes else {
+            throw XetDownloaderError.invalidReconstruction
+        }
         return totalWritten
     }
 
