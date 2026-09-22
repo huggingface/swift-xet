@@ -111,7 +111,8 @@ public final class XetDownloader: @unchecked Sendable {
             ProcessInfo.processInfo.activeProcessorCount
         )
 
-        /// Maximum number of decoded buffers held in memory. Defaults to 16.
+        /// Maximum number of received network buffers waiting to be decoded,
+        /// per fetch. Defaults to 16.
         public var maxInflightBuffers: Int = 16
 
         /// Maximum concurrent HTTP/1 connections per host. Defaults to 24.
@@ -245,7 +246,12 @@ public final class XetDownloader: @unchecked Sendable {
     ///     An empty range (where `lowerBound == upperBound`) returns
     ///     an empty `Data` immediately without making any network requests.
     ///   - progress: Optional callback with completed and total output bytes.
-    ///     See ``download(_:byteRange:to:fileManager:progress:)`` for its contract.
+    ///     See ``download(_:byteRange:to:fileManager:progress:)`` for its contract,
+    ///     with two differences:
+    ///     the callback runs on the calling task,
+    ///     and intermediate updates occur after whole reconstruction terms
+    ///     are appended, so a file reconstructed from one term reports
+    ///     only the final update, regardless of its size.
     ///
     /// - Returns: The file contents, or the requested byte range.
     ///
@@ -283,21 +289,23 @@ public final class XetDownloader: @unchecked Sendable {
 
     /// Downloads a file and writes it to disk.
     ///
+    /// Chunks are written at their final offsets as they decode,
+    /// so fetches for different parts of the file complete in any order
+    /// and memory use is bounded by network buffers, not by file size.
+    /// If the download fails, the file may hold bytes from any part of the output.
+    ///
     /// Progress counts reconstructed bytes written to the output,
     /// not compressed network bytes.
     /// For partial downloads, counts exclude skipped and truncated bytes.
     /// Reused chunks count once for each position they occupy in the output.
     ///
-    /// The callback runs synchronously on the download task, without a specific
-    /// actor or queue, and should return promptly.
-    /// Calls are serial within each download.
-    /// Intermediate updates occur after reconstruction terms are written,
+    /// The callback runs synchronously on the task that wrote the bytes,
+    /// without a specific actor or queue, and should return promptly.
+    /// Calls are serial within each download and counts never decrease.
+    /// Intermediate updates occur as chunks are written,
     /// at most once every 100 milliseconds.
     /// The first intermediate update and the final update bypass this interval.
     /// Short downloads may report only the final update.
-    /// A file reconstructed from one term reports only the final update,
-    /// regardless of its size.
-    /// No updates occur while that term downloads and decodes.
     ///
     /// On success, the final callback has equal completed and total counts,
     /// including `(0, 0)` for empty output.
@@ -381,11 +389,24 @@ public final class XetDownloader: @unchecked Sendable {
 
     // MARK: -
 
+    /// The fetch concurrency limit after applying `autoScaleFetchConcurrency`.
+    private var maxConcurrentFetches: Int {
+        let configured = max(1, configuration.maxConcurrentFetches)
+        guard configuration.autoScaleFetchConcurrency else {
+            return configured
+        }
+        let poolSize = max(1, configuration.poolSize)
+        return max(configured, poolSize * max(1, configuration.connectionsPerHost))
+    }
+
     /// Core download implementation that writes to any ``WriteTarget``.
     ///
-    /// Processes reconstruction terms in order, fetching xorb data and
-    /// decompressing chunks. Implements caching for xorbs referenced by
-    /// multiple terms to avoid redundant downloads.
+    /// Resolves the reconstruction and works out where each term's bytes
+    /// land in the output, then fetches and decodes xorb ranges.
+    /// File targets receive each chunk at its final offset as it decodes,
+    /// so fetches complete in any order and memory stays bounded by
+    /// network buffers.
+    /// In-memory targets receive whole terms in order.
     private func download(
         fileID: String,
         byteRange: Range<UInt64>?,
@@ -417,7 +438,6 @@ public final class XetDownloader: @unchecked Sendable {
         )
         try Task.checkCancellation()
         let maxBytesToWrite = byteRange.map { $0.upperBound - $0.lowerBound }
-        var remainingBytesToWrite = maxBytesToWrite
 
         var reconstructedBytes: UInt64 = 0
         for term in reconstruction.terms {
@@ -432,18 +452,14 @@ public final class XetDownloader: @unchecked Sendable {
         guard let totalBytes = Int64(exactly: min(availableBytes, maxBytesToWrite ?? availableBytes)) else {
             throw XetDownloaderError.invalidReconstruction
         }
-        var lastProgressUpdate: TimeInterval?
 
-        var bytesToSkipInFirstTerm = reconstruction.offsetIntoFirstRange
-
-        var xorbUsageCount: [String: Int] = [:]
-        for term in reconstruction.terms {
-            xorbUsageCount[term.hash, default: 0] += 1
-        }
+        // The output window within the concatenated terms.
+        let outputStart = reconstruction.offsetIntoFirstRange
+        let outputEnd = outputStart + UInt64(totalBytes)
+        var termStart: UInt64 = 0
 
         var termContexts: [TermContext] = []
         termContexts.reserveCapacity(reconstruction.terms.count)
-        var expectedUnpackedBytesByKey: [FetchRangeKey: Int] = [:]
         for term in reconstruction.terms {
             guard let fetchInfos = reconstruction.fetchInfo[term.hash] else {
                 throw XetDownloaderError.invalidReconstruction
@@ -475,31 +491,144 @@ public final class XetDownloader: @unchecked Sendable {
                 urlRangeStart: fetchInfo.urlRange.lowerBound,
                 urlRangeEnd: fetchInfo.urlRange.upperBound
             )
-            expectedUnpackedBytesByKey[key, default: 0] += Int(term.unpackedLength)
+
+            // Intersect the term with the output window.
+            let termEnd = termStart + UInt64(term.unpackedLength)
+            let writeStart = max(termStart, outputStart)
+            let writeEnd = min(termEnd, outputEnd)
+            let layout: TermLayout
+            if writeStart < writeEnd {
+                layout = TermLayout(
+                    skip: Int(writeStart - termStart),
+                    length: Int(writeEnd - writeStart),
+                    outputOffset: Int64(writeStart - outputStart)
+                )
+            } else {
+                layout = .empty
+            }
+            termStart = termEnd
 
             termContexts.append(
                 TermContext(
                     term: term,
                     fetchInfo: fetchInfo,
                     key: key,
-                    request: request
+                    request: request,
+                    layout: layout
                 )
             )
         }
 
-        var chunkCache: [FetchRangeKey: FetchedXorb] = [:]
-
-        var totalWritten: Int64 = 0
-        var writeOffset: Int64 = 0
-        let effectiveMaxConcurrentFetches = max(1, configuration.maxConcurrentFetches)
-        let maxConcurrentFetches: Int
-        if configuration.autoScaleFetchConcurrency {
-            let poolSize = max(1, configuration.poolSize)
-            let target = poolSize * max(1, configuration.connectionsPerHost)
-            maxConcurrentFetches = max(effectiveMaxConcurrentFetches, target)
-        } else {
-            maxConcurrentFetches = effectiveMaxConcurrentFetches
+        let tracker = ProgressTracker(totalBytes: totalBytes, callback: progress)
+        switch target {
+        case .file(let writer):
+            try await downloadToFile(termContexts, writer: writer, progress: tracker)
+        case .inMemory(let writer):
+            try await downloadInOrder(termContexts, writer: writer, progress: tracker)
         }
+
+        try Task.checkCancellation()
+        let totalWritten = tracker.completedBytes
+        guard totalWritten == totalBytes else {
+            throw XetDownloaderError.invalidReconstruction
+        }
+        return totalWritten
+    }
+
+    /// Fetches each distinct range once and writes its chunks at their
+    /// final offsets as they decode.
+    ///
+    /// Fetches start in file order and complete in any order.
+    /// At most `maxConcurrentFetches` run at once.
+    private func downloadToFile(
+        _ termContexts: [TermContext],
+        writer: FileOutputWriter,
+        progress: ProgressTracker
+    ) async throws {
+        // Group the terms by the range that serves them, in order of first use.
+        var keys: [FetchRangeKey] = []
+        var termsByKey: [FetchRangeKey: [TermContext]] = [:]
+        for context in termContexts where context.layout.length > 0 {
+            if termsByKey[context.key] == nil {
+                keys.append(context.key)
+            }
+            termsByKey[context.key, default: []].append(context)
+        }
+
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for (index, key) in keys.enumerated() {
+                    if index >= maxConcurrentFetches {
+                        // Wait for a fetch to finish before starting another.
+                        try await group.next()
+                    }
+                    guard let contexts = termsByKey[key] else { continue }
+                    group.addTask {
+                        try await self.fetchAndWrite(contexts, writer: writer, progress: progress)
+                    }
+                }
+                try await group.waitForAll()
+            }
+        } catch {
+            // A canceled fetch fails with a decoding error; report the cancellation instead.
+            try Task.checkCancellation()
+            throw error
+        }
+    }
+
+    /// Fetches one range and writes every term it serves.
+    ///
+    /// All contexts share the same fetch key.
+    /// Chunks decode in order within the range, so a running byte count
+    /// per term gives each chunk's position in that term's output.
+    private func fetchAndWrite(
+        _ contexts: [TermContext],
+        writer: FileOutputWriter,
+        progress: ProgressTracker
+    ) async throws {
+        guard let first = contexts.first else { return }
+        try Task.checkCancellation()
+        let firstChunkIndex = first.fetchInfo.range.lowerBound
+        var decodedBytes = [Int](repeating: 0, count: contexts.count)
+        try await fetchXorbChunks(request: first.request) { ordinal, chunk in
+            let chunkIndex = firstChunkIndex + ordinal
+            for (slot, context) in contexts.enumerated() where context.term.range.contains(chunkIndex) {
+                let layout = context.layout
+                let chunkStart = decodedBytes[slot]
+                decodedBytes[slot] = chunkStart + chunk.count
+                // Clip the chunk to the bytes this term contributes to the output.
+                let lower = max(chunkStart, layout.skip)
+                let upper = min(chunkStart + chunk.count, layout.skip + layout.length)
+                guard lower < upper else { continue }
+                let bytes = UnsafeRawBufferPointer(rebasing: chunk[(lower - chunkStart) ..< (upper - chunkStart)])
+                try writer.write(contentsOf: bytes, at: layout.outputOffset + Int64(lower - layout.skip))
+                progress.add(Int64(upper - lower))
+            }
+        }
+        try Task.checkCancellation()
+        for (slot, context) in contexts.enumerated() {
+            guard decodedBytes[slot] == Int(context.term.unpackedLength) else {
+                throw XetDownloaderError.invalidReconstruction
+            }
+        }
+    }
+
+    /// Fetches ranges ahead of the current term and appends whole terms in order.
+    ///
+    /// Ranges referenced by more than one term stay cached until the download ends.
+    private func downloadInOrder(
+        _ termContexts: [TermContext],
+        writer: DataOutputWriter,
+        progress: ProgressTracker
+    ) async throws {
+        var xorbUsageCount: [String: Int] = [:]
+        var expectedUnpackedBytesByKey: [FetchRangeKey: Int] = [:]
+        for context in termContexts {
+            xorbUsageCount[context.term.hash, default: 0] += 1
+            expectedUnpackedBytesByKey[context.key, default: 0] += Int(context.term.unpackedLength)
+        }
+
+        var chunkCache: [FetchRangeKey: FetchedXorb] = [:]
         let fetchSemaphore = AsyncSemaphore(maxConcurrentTasks: maxConcurrentFetches)
         var inflightFetches: [FetchRangeKey: Task<FetchedXorb, Error>] = [:]
         defer {
@@ -507,7 +636,6 @@ public final class XetDownloader: @unchecked Sendable {
                 task.cancel()
             }
         }
-        let writeRaw = target.writeContentsOf
 
         func termRange(from fetched: FetchedXorb, for term: CASClient.ReconstructionResponse.Term) throws -> Range<Int>
         {
@@ -527,68 +655,23 @@ public final class XetDownloader: @unchecked Sendable {
             return startByte ..< endByte
         }
 
-        func writeTermData(base: Data, range: Range<Int>) async throws {
+        func writeTermData(from fetched: FetchedXorb, for context: TermContext) async throws {
             try Task.checkCancellation()
-            var lower = range.lowerBound
-            var upper = range.upperBound
-            if lower >= upper {
+            let range = try termRange(from: fetched, for: context.term)
+            let layout = context.layout
+            guard layout.length > 0 else {
                 return
             }
-
-            if bytesToSkipInFirstTerm > 0 {
-                let available = upper - lower
-                let skip = min(UInt64(available), bytesToSkipInFirstTerm)
-                lower += Int(skip)
-                bytesToSkipInFirstTerm -= skip
-                if lower >= upper {
-                    return
-                }
-            }
-
-            if let remaining = remainingBytesToWrite {
-                if remaining == 0 {
-                    return
-                }
-                let available = upper - lower
-                if UInt64(available) > remaining {
-                    upper = lower + Int(remaining)
-                }
-                remainingBytesToWrite = remaining - UInt64(upper - lower)
-            }
-
-            let offset = writeOffset
-            writeOffset += Int64(upper - lower)
-
-            if let writeRaw {
-                try base.withUnsafeBytes { raw in
-                    guard let baseAddress = raw.baseAddress else {
-                        throw XetDownloaderError.invalidReconstruction
-                    }
-                    let start = baseAddress.advanced(by: lower)
-                    let slice = UnsafeRawBufferPointer(start: start, count: upper - lower)
-                    try writeRaw(slice, offset)
-                }
-            } else {
-                let chunk = base.subdata(in: lower ..< upper)
-                try await target.write(chunk)
-            }
-
-            totalWritten += Int64(upper - lower)
+            let lower = range.lowerBound + layout.skip
+            try await writer.write(fetched.data.subdata(in: lower ..< (lower + layout.length)))
             try Task.checkCancellation()
-            if let progress, totalWritten < totalBytes {
-                let now = ProcessInfo.processInfo.systemUptime
-                if lastProgressUpdate.map({ now - $0 >= 0.1 }) ?? true {
-                    lastProgressUpdate = now
-                    progress(totalWritten, totalBytes)
-                }
-            }
+            progress.add(Int64(layout.length))
         }
 
         func ensureFetchTask(for context: TermContext) {
-            let term = context.term
             let key = context.key
-            let shouldCacheAllForXorb = (xorbUsageCount[term.hash] ?? 0) > 1
-            let expectedUnpackedLength = expectedUnpackedBytesByKey[key]
+            let shouldCacheAllForXorb = (xorbUsageCount[context.term.hash] ?? 0) > 1
+            let expectedUnpackedLength = expectedUnpackedBytesByKey[key] ?? 0
 
             if inflightFetches[key] != nil {
                 return
@@ -601,10 +684,8 @@ public final class XetDownloader: @unchecked Sendable {
                 await fetchSemaphore.wait()
                 do {
                     try Task.checkCancellation()
-                    let fetched = try await fetchXorbChunks(
-                        termHash: term.hash,
-                        fetchInfo: context.fetchInfo,
-                        request: context.request,
+                    let fetched = try await fetchXorbRange(
+                        context,
                         expectedUnpackedLength: expectedUnpackedLength
                     )
                     await fetchSemaphore.signal()
@@ -618,24 +699,24 @@ public final class XetDownloader: @unchecked Sendable {
 
         for (termIndex, context) in termContexts.enumerated() {
             try Task.checkCancellation()
-            let term = context.term
             let key = context.key
-            if let remainingBytesToWrite, remainingBytesToWrite == 0 {
+            if progress.completedBytes == progress.totalBytes {
                 break
             }
-
-            if let cached = chunkCache[key] {
-                let range = try termRange(from: cached, for: term)
-                try await writeTermData(base: cached.data, range: range)
+            if context.layout.length == 0 {
                 continue
             }
 
-            let shouldCacheAllForXorb = (xorbUsageCount[term.hash] ?? 0) > 1
+            if let cached = chunkCache[key] {
+                try await writeTermData(from: cached, for: context)
+                continue
+            }
+
+            let shouldCacheAllForXorb = (xorbUsageCount[context.term.hash] ?? 0) > 1
             let prefetchLimit = min(termContexts.count, termIndex + maxConcurrentFetches)
-            for prefetchIndex in termIndex ..< prefetchLimit {
+            for prefetchIndex in termIndex ..< prefetchLimit where termContexts[prefetchIndex].layout.length > 0 {
                 ensureFetchTask(for: termContexts[prefetchIndex])
             }
-            ensureFetchTask(for: context)
             guard let fetchTask = inflightFetches[key] else {
                 continue
             }
@@ -653,23 +734,37 @@ public final class XetDownloader: @unchecked Sendable {
             if shouldCacheAllForXorb {
                 chunkCache[key] = fetchedChunks
             }
-            let range = try termRange(from: fetchedChunks, for: term)
-            try await writeTermData(base: fetchedChunks.data, range: range)
+            try await writeTermData(from: fetchedChunks, for: context)
         }
-
-        try Task.checkCancellation()
-        guard totalWritten == totalBytes else {
-            throw XetDownloaderError.invalidReconstruction
-        }
-        return totalWritten
     }
 
-    private func fetchXorbChunks(
-        termHash: String,
-        fetchInfo: CASClient.ReconstructionResponse.FetchInfo,
-        request: URLRequest,
-        expectedUnpackedLength: Int?
+    /// Fetches one range and returns its decoded chunks as one buffer.
+    private func fetchXorbRange(
+        _ context: TermContext,
+        expectedUnpackedLength: Int
     ) async throws -> FetchedXorb {
+        var data = Data()
+        data.reserveCapacity(expectedUnpackedLength)
+        var chunkByteIndices: [Int] = [0]
+        try await fetchXorbChunks(request: context.request) { _, chunk in
+            data.append(contentsOf: chunk)
+            chunkByteIndices.append(data.count)
+        }
+        return FetchedXorb(
+            data: data,
+            chunkByteIndices: chunkByteIndices,
+            chunkRange: context.fetchInfo.range
+        )
+    }
+
+    /// Fetches one xorb range and hands each decoded chunk to `sink`
+    /// with its ordinal within the range.
+    ///
+    /// The chunk buffer is only valid for the duration of the call.
+    private func fetchXorbChunks(
+        request: URLRequest,
+        sink: (_ ordinal: Int, _ chunk: UnsafeRawBufferPointer) throws -> Void
+    ) async throws {
         guard let url = request.url else {
             throw XetDownloaderError.fetchFailed(statusCode: nil, url: URL(fileURLWithPath: "/"))
         }
@@ -716,166 +811,85 @@ public final class XetDownloader: @unchecked Sendable {
                 task.cancel()
             }
         }
-        let decoded = try await decodeXorbStream(
-            stream: stream,
-            bufferSemaphore: bufferSemaphore,
-            expectedUnpackedLength: expectedUnpackedLength
-        )
-        return FetchedXorb(
-            data: decoded.data,
-            chunkByteIndices: decoded.chunkByteIndices,
-            chunkRange: fetchInfo.range
-        )
+        try await decodeXorbStream(stream: stream, bufferSemaphore: bufferSemaphore, sink: sink)
     }
 
+    /// Decodes chunks from a xorb byte stream and hands each one to `sink`.
+    ///
+    /// Each chunk decodes into a scratch buffer that is reused for the next chunk,
+    /// so memory stays at one chunk plus the undecoded bytes in the cursor.
     private func decodeXorbStream(
         stream: AsyncThrowingStream<ByteBuffer, Error>,
         bufferSemaphore: AsyncSemaphore,
-        expectedUnpackedLength: Int?
-    ) async throws -> (data: Data, chunkByteIndices: [Int]) {
-        if let expectedUnpackedLength, expectedUnpackedLength > 0 {
-            return try await decodeXorbStreamPreallocated(
-                stream: stream,
-                bufferSemaphore: bufferSemaphore,
-                totalOutputSize: expectedUnpackedLength
-            )
-        }
-
+        sink: (_ ordinal: Int, _ chunk: UnsafeRawBufferPointer) throws -> Void
+    ) async throws {
         var cursor = ByteCursor()
-        var data = Data()
-        var chunkByteIndices: [Int] = [0]
-
-        func drainCursor(isEOF: Bool) throws {
-            while true {
-                if let uncompressed = try Xorb.decodeNextChunk(from: &cursor) {
-                    data.append(uncompressed)
-                    chunkByteIndices.append(data.count)
-                    continue
-                }
-                if isEOF {
-                    if cursor.count == 0 {
-                        return
-                    }
-                    throw XorbError.truncatedStream
-                }
-                break
-            }
+        var output = ScratchBuffer()
+        var grouped = ScratchBuffer()
+        defer {
+            output.deallocate()
+            grouped.deallocate()
         }
+        var ordinal = 0
 
         for try await buffer in stream {
             if buffer.readableBytes > 0 {
                 buffer.withUnsafeReadableBytes { raw in
-                    cursor.append(raw)
+                    cursor.append(contentsOf: raw)
                 }
             }
             await bufferSemaphore.signal()
-            try drainCursor(isEOF: false)
-        }
 
-        try drainCursor(isEOF: true)
-        return (data: data, chunkByteIndices: chunkByteIndices)
-    }
+            while cursor.count >= 8 {
+                let header = try cursor.withUnsafeReadableBytes { try Xorb.parseHeader($0) }
+                guard cursor.count >= 8 + header.compressedLength else { break }
+                _ = cursor.skip(count: 8)
 
-    private func decodeXorbStreamPreallocated(
-        stream: AsyncThrowingStream<ByteBuffer, Error>,
-        bufferSemaphore: AsyncSemaphore,
-        totalOutputSize: Int
-    ) async throws -> (data: Data, chunkByteIndices: [Int]) {
-        let outputBuffer = UnsafeMutableRawPointer.allocate(
-            byteCount: totalOutputSize,
-            alignment: 16
-        )
-        var outputBufferToFree: UnsafeMutableRawPointer? = outputBuffer
-        defer {
-            outputBufferToFree?.deallocate()
-        }
-
-        var cursor = ByteCursor()
-        var chunkByteIndices: [Int] = [0]
-        chunkByteIndices.reserveCapacity(1024)
-        var writeOffset = 0
-
-        do {
-            for try await buffer in stream {
-                if buffer.readableBytes > 0 {
-                    buffer.withUnsafeReadableBytes { raw in
-                        cursor.append(raw)
-                    }
-                }
-                await bufferSemaphore.signal()
-
-                while cursor.count >= 8 {
-                    guard let headerBytes = cursor.peek(count: 8) else { break }
-                    let header = try headerBytes.withUnsafeBytes { try Xorb.parseHeader($0) }
-                    let totalLength = 8 + header.compressedLength
-
-                    guard cursor.count >= totalLength else { break }
-
-                    _ = cursor.skip(count: 8)
-                    let outputSlice = UnsafeMutableRawBufferPointer(
-                        start: outputBuffer.advanced(by: writeOffset),
-                        count: header.uncompressedLength
+                let chunk = output.prepare(count: header.uncompressedLength)
+                try cursor.withUnsafeReadableBytes { readable in
+                    let compressed = UnsafeRawBufferPointer(
+                        start: readable.baseAddress,
+                        count: header.compressedLength
                     )
-
-                    try cursor.withUnsafeReadableBytes { readable in
-                        let compressed = UnsafeRawBufferPointer(
-                            start: readable.baseAddress,
-                            count: header.compressedLength
-                        )
-                        switch header.compressionScheme {
-                        case .none:
-                            guard header.compressedLength == header.uncompressedLength else {
-                                throw XorbError.lengthMismatch(
-                                    expected: header.uncompressedLength,
-                                    actual: header.compressedLength
-                                )
-                            }
-                            if let src = compressed.baseAddress, let dst = outputSlice.baseAddress {
-                                memcpy(dst, src, header.compressedLength)
-                            }
-
-                        case .lz4:
-                            _ = try LZ4.decompressBlock(
-                                compressed,
-                                uncompressedLength: header.uncompressedLength,
-                                output: outputSlice
+                    switch header.compressionScheme {
+                    case .none:
+                        guard header.compressedLength == header.uncompressedLength else {
+                            throw XorbError.lengthMismatch(
+                                expected: header.uncompressedLength,
+                                actual: header.compressedLength
                             )
-
-                        case .byteGrouping4LZ4:
-                            let scratch = UnsafeMutableRawBufferPointer.allocate(
-                                byteCount: header.uncompressedLength,
-                                alignment: 16
-                            )
-                            defer { scratch.deallocate() }
-                            _ = try LZ4.decompressBlock(
-                                compressed,
-                                uncompressedLength: header.uncompressedLength,
-                                output: scratch
-                            )
-                            BG4.regroup(UnsafeRawBufferPointer(scratch), into: outputSlice)
                         }
+                        if let src = compressed.baseAddress, let dst = chunk.baseAddress {
+                            memcpy(dst, src, header.compressedLength)
+                        }
+
+                    case .lz4:
+                        _ = try LZ4.decompressBlock(
+                            compressed,
+                            uncompressedLength: header.uncompressedLength,
+                            output: chunk
+                        )
+
+                    case .byteGrouping4LZ4:
+                        let scratch = grouped.prepare(count: header.uncompressedLength)
+                        _ = try LZ4.decompressBlock(
+                            compressed,
+                            uncompressedLength: header.uncompressedLength,
+                            output: scratch
+                        )
+                        BG4.regroup(UnsafeRawBufferPointer(scratch), into: chunk)
                     }
-
-                    cursor.consume(count: header.compressedLength)
-                    writeOffset += header.uncompressedLength
-                    chunkByteIndices.append(writeOffset)
                 }
-            }
+                cursor.consume(count: header.compressedLength)
 
-            if cursor.count > 0 {
-                throw XorbError.truncatedStream
+                try sink(ordinal, UnsafeRawBufferPointer(chunk))
+                ordinal += 1
             }
-        } catch {
-            throw error
         }
 
-        let data = Data(
-            bytesNoCopy: outputBuffer,
-            count: writeOffset,
-            deallocator: .custom { ptr, _ in ptr.deallocate() }
-        )
-        outputBufferToFree = nil
-        return (data: data, chunkByteIndices: chunkByteIndices)
+        if cursor.count > 0 {
+            throw XorbError.truncatedStream
+        }
     }
 
     private struct TermContext {
@@ -883,6 +897,87 @@ public final class XetDownloader: @unchecked Sendable {
         let fetchInfo: CASClient.ReconstructionResponse.FetchInfo
         let key: FetchRangeKey
         let request: URLRequest
+        let layout: TermLayout
+    }
+
+    /// Where a term's decoded bytes land in the output.
+    private struct TermLayout {
+        /// Decoded bytes to skip at the start of the term.
+        let skip: Int
+        /// Decoded bytes to write after the skipped bytes.
+        let length: Int
+        /// Output offset of the first written byte.
+        let outputOffset: Int64
+
+        /// A term that contributes nothing to the output.
+        static let empty = TermLayout(skip: 0, length: 0, outputOffset: 0)
+    }
+}
+
+/// Counts written output bytes and throttles progress callbacks.
+///
+/// File downloads write from several fetch tasks at once,
+/// so the count and the throttle timestamp live behind a lock.
+/// The callback runs under that lock, which keeps calls serial
+/// and the reported counts monotonic.
+private final class ProgressTracker: @unchecked Sendable {
+    private let lock = NIOLock()
+    private var completed: Int64 = 0
+    private var lastUpdate: TimeInterval?
+    private let callback: (@Sendable (Int64, Int64) -> Void)?
+
+    /// The expected output size.
+    let totalBytes: Int64
+
+    init(totalBytes: Int64, callback: (@Sendable (Int64, Int64) -> Void)?) {
+        self.totalBytes = totalBytes
+        self.callback = callback
+    }
+
+    /// The bytes written so far.
+    var completedBytes: Int64 {
+        lock.withLock { completed }
+    }
+
+    /// Adds written bytes and reports them,
+    /// unless an update went out less than 100 milliseconds ago
+    /// or the output is complete.
+    ///
+    /// The caller reports completion after the output is finalized.
+    func add(_ count: Int64) {
+        lock.withLock {
+            completed += count
+            guard let callback, completed < totalBytes else {
+                return
+            }
+            let now = ProcessInfo.processInfo.systemUptime
+            if lastUpdate.map({ now - $0 >= 0.1 }) ?? true {
+                lastUpdate = now
+                callback(completed, totalBytes)
+            }
+        }
+    }
+}
+
+/// A reusable buffer that grows to the largest chunk seen.
+private struct ScratchBuffer {
+    private var pointer: UnsafeMutableRawPointer?
+    private var capacity = 0
+
+    /// Returns a buffer of `count` bytes, reallocating if it must grow.
+    mutating func prepare(count: Int) -> UnsafeMutableRawBufferPointer {
+        if count > capacity {
+            pointer?.deallocate()
+            pointer = UnsafeMutableRawPointer.allocate(byteCount: count, alignment: 16)
+            capacity = count
+        }
+        return UnsafeMutableRawBufferPointer(start: pointer, count: count)
+    }
+
+    mutating func deallocate() {
+        pointer?.deallocate()
+        pointer = nil
+        capacity = 0
     }
 }
 
@@ -1207,54 +1302,25 @@ private struct FetchedXorb {
     let chunkRange: Range<Int>
 }
 
-/// A destination for writing downloaded chunk data.
-private struct WriteTarget: Sendable {
-    /// Writes sequential chunk data in order.
-    let write: @Sendable (Data) async throws -> Void
+/// A destination for downloaded bytes.
+private enum WriteTarget: Sendable {
+    /// Receives whole terms in order.
+    case inMemory(DataOutputWriter)
 
-    /// Writes raw bytes to a specific output offset.
-    let writeContentsOf: (@Sendable (UnsafeRawBufferPointer, Int64) throws -> Void)?
-
-    /// Closes the destination when available.
-    let close: (@Sendable () async throws -> Void)?
-
-    static func inMemory(_ writer: DataOutputWriter) -> WriteTarget {
-        WriteTarget(
-            write: { chunk in
-                try await writer.write(chunk)
-            },
-            writeContentsOf: nil,
-            close: nil
-        )
-    }
-
-    static func file(_ writer: FileOutputWriter) -> WriteTarget {
-        WriteTarget(
-            write: { chunk in
-                try await writer.write(chunk)
-            },
-            writeContentsOf: { buffer, offset in
-                try writer.write(contentsOf: buffer, at: offset)
-            },
-            close: {
-                try await writer.close()
-            }
-        )
-    }
+    /// Receives chunks at their final offsets, in any order.
+    case file(FileOutputWriter)
 
     func closeIfNeeded() async throws {
-        if let close {
-            try await close()
+        if case .file(let writer) = self {
+            try await writer.close()
         }
     }
 
     func closeIfNeeded(catching handler: (Error) -> Void) async {
-        if let close {
-            do {
-                try await close()
-            } catch {
-                handler(error)
-            }
+        do {
+            try await closeIfNeeded()
+        } catch {
+            handler(error)
         }
     }
 }
@@ -1269,10 +1335,11 @@ actor DataOutputWriter {
 }
 
 /// A random access output writer backed by POSIX pwrite.
+///
+/// Positional writes are safe to issue from several tasks at once.
 final class FileOutputWriter: @unchecked Sendable {
     private let lock = NIOLock()
     private var fd: Int32
-    private var sequentialOffset: Int64 = 0
 
     init(destinationURL: URL) throws {
         let fm = FileManager.default
@@ -1314,17 +1381,6 @@ final class FileOutputWriter: @unchecked Sendable {
             }
             bytesRemaining -= written
             localOffset += written
-        }
-    }
-
-    func write(_ data: Data) async throws {
-        let offset = lock.withLock {
-            let offset = sequentialOffset
-            sequentialOffset += Int64(data.count)
-            return offset
-        }
-        try data.withUnsafeBytes { rawBuffer in
-            try write(contentsOf: rawBuffer, at: offset)
         }
     }
 
