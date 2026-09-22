@@ -87,14 +87,19 @@ For partial downloads, they include only the requested output.
 Chunk reuse counts each output position once.
 Each call starts a new count, including retries by the caller.
 
-Updates occur after reconstruction terms are written,
-at most once every 100 milliseconds.
+Updates occur at most once every 100 milliseconds.
 The first intermediate update and the final update bypass this interval.
 Short downloads may report only completion.
-A file reconstructed from one term reports only completion, even if it is large.
-No updates occur while that term downloads and decodes.
-The callback runs on the download task and must return promptly;
+The callback must return promptly;
 it does not run on a specific actor or queue.
+Calls are serial within each download and counts never decrease.
+
+Disk downloads write each chunk at its final offset as it decodes,
+so updates arrive as bytes reach the file
+and memory use is bounded by network buffers rather than file size.
+In-memory downloads append whole reconstruction terms in order
+and report after each one,
+so a file reconstructed from one term reports only completion.
 
 A successful download reports equal completed and total counts,
 including `(0, 0)` for empty output.

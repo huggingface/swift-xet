@@ -26,7 +26,7 @@ struct DownloadProgressTests {
     }
 
     @Test func diskDownloadCompletesAfterOutputIsAvailable() async throws {
-        try await withFixture { downloader, _ in
+        try await withFixture { downloader, requests in
             let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: destination) }
             let progress = ProgressRecorder()
@@ -40,6 +40,35 @@ struct DownloadProgressTests {
             #expect(written == 12)
             #expect(progress.values.first == .init(completed: 4, total: 12))
             #expect(progress.values.last == .init(completed: written, total: written))
+            #expect(progress.values.filter { $0.completed == $0.total }.count == 1)
+            // One fetch serves both terms that reference xorb "a".
+            #expect(requests.count(for: "/a") == 1)
+        }
+    }
+
+    @Test func diskDownloadWritesTermsOutOfOrder() async throws {
+        try await withFixture(
+            hashes: ["b", "a"],
+            delayB: .milliseconds(250),
+            maxConcurrentFetches: 2
+        ) { downloader, requests in
+            let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: destination) }
+            let progress = ProgressRecorder()
+            let written = try await downloader.download(Self.fileID, to: destination) { completed, total in
+                if progress.values.isEmpty {
+                    // The second term is on disk before the first term's response arrives.
+                    #expect(requests.responseCount(for: "/b") == 0)
+                }
+                progress.record(completed, total)
+            }
+
+            #expect(written == 8)
+            #expect(progress.values.first == .init(completed: 4, total: 8))
+            #expect(progress.values.last == .init(completed: 8, total: 8))
+            let fileData = try Data(contentsOf: destination)
+            #expect(fileData == Data("BBBBaaaa".utf8))
+            #expect(try await downloader.data(for: Self.fileID) == fileData)
         }
     }
 
@@ -51,6 +80,26 @@ struct DownloadProgressTests {
             #expect(data == Data("aaBBBB".utf8))
             #expect(progress.values.first == .init(completed: 2, total: 6))
             #expect(progress.values.last == .init(completed: 6, total: 6))
+        }
+    }
+
+    @Test func partialDiskDownloadExcludesSkippedAndTruncatedBytes() async throws {
+        try await withFixture(offset: 2) { downloader, requests in
+            let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: destination) }
+            let progress = ProgressRecorder()
+            let written = try await downloader.download(
+                Self.fileID,
+                byteRange: 2 ..< 8,
+                to: destination,
+                progress: progress.record
+            )
+
+            #expect(written == 6)
+            #expect(try Data(contentsOf: destination) == Data("aaBBBB".utf8))
+            #expect(progress.values.first == .init(completed: 2, total: 6))
+            #expect(progress.values.last == .init(completed: 6, total: 6))
+            #expect(requests.count(for: "/a") == 1)
         }
     }
 
@@ -159,8 +208,7 @@ struct DownloadProgressTests {
         }
     }
 
-    @Test(arguments: [false, true])
-    func largeSingleTermReportsOnlyCompletion(writeToDisk: Bool) async throws {
+    @Test func largeSingleTermInMemoryReportsOnlyCompletion() async throws {
         let xorb = StreamedXorbFixture()
         try await withFixture(
             hashes: ["a"],
@@ -168,20 +216,10 @@ struct DownloadProgressTests {
             streamedXorb: xorb
         ) { downloader, requests in
             let progress = ProgressRecorder()
-            let record: @Sendable (Int64, Int64) -> Void = { completed, total in
+            let output = try await downloader.data(for: Self.fileID) { completed, total in
                 // Decoded chunks do not count until the complete term is written.
                 #expect(requests.sentChunks == xorb.chunks.count)
                 progress.record(completed, total)
-            }
-            let output: Data
-            if writeToDisk {
-                let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-                defer { try? FileManager.default.removeItem(at: destination) }
-                let written = try await downloader.download(Self.fileID, to: destination, progress: record)
-                #expect(written == Int64(xorb.output.count))
-                output = try Data(contentsOf: destination)
-            } else {
-                output = try await downloader.data(for: Self.fileID, progress: record)
             }
 
             #expect(output == xorb.output)
@@ -189,6 +227,62 @@ struct DownloadProgressTests {
             #expect(requests.sentChunks == 128)
             let expectedBytes: Int64 = 8 * 1024 * 1024
             #expect(progress.values == [.init(completed: expectedBytes, total: expectedBytes)])
+        }
+    }
+
+    @Test func largeSingleTermOnDiskReportsChunksAsTheyArrive() async throws {
+        let xorb = StreamedXorbFixture()
+        try await withFixture(
+            hashes: ["a"],
+            unpackedLength: UInt32(xorb.output.count),
+            streamedXorb: xorb
+        ) { downloader, requests in
+            let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: destination) }
+            let progress = ProgressRecorder()
+            let chunksSentAtFirstUpdate = Counter()
+            let written = try await downloader.download(Self.fileID, to: destination) { completed, total in
+                if progress.values.isEmpty {
+                    chunksSentAtFirstUpdate.value = requests.sentChunks
+                }
+                progress.record(completed, total)
+            }
+
+            #expect(written == Int64(xorb.output.count))
+            #expect(try Data(contentsOf: destination) == xorb.output)
+            #expect(requests.count(for: "/a") == 1)
+            // The first update arrives while the term is still downloading.
+            #expect(chunksSentAtFirstUpdate.value < xorb.chunks.count)
+            #expect(progress.values.first?.completed ?? 0 > 0)
+            // The response spans more than six throttle intervals.
+            #expect(progress.values.count > 3)
+            #expect(progress.values.map(\.completed) == progress.values.map(\.completed).sorted())
+            #expect(progress.values.allSatisfy { $0.total == Int64(xorb.output.count) })
+            #expect(progress.values.filter { $0.completed == $0.total }.count == 1)
+            #expect(progress.values.last?.completed == Int64(xorb.output.count))
+        }
+    }
+
+    @Test(arguments: [false, true])
+    func termsCoveringPartsOfOneFetchWriteInTermOrder(writeToDisk: Bool) async throws {
+        let xorb = StreamedXorbFixture()
+        // Two terms share one fetch and appear in the file in reverse chunk order.
+        let termRanges = [64 ..< 128, 0 ..< 64]
+        try await withFixture(streamedXorb: xorb, termRanges: termRanges) { downloader, requests in
+            let output: Data
+            if writeToDisk {
+                let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: destination) }
+                let written = try await downloader.download(Self.fileID, to: destination)
+                #expect(written == Int64(xorb.output.count))
+                output = try Data(contentsOf: destination)
+            } else {
+                output = try await downloader.data(for: Self.fileID)
+            }
+
+            let half = xorb.output.count / 2
+            #expect(output == xorb.output[half...] + xorb.output[..<half])
+            #expect(requests.count(for: "/a") == 1)
         }
     }
 
@@ -219,8 +313,11 @@ struct DownloadProgressTests {
                 try await downloader.download(Self.fileID, to: destination, progress: progress.record)
             }
             #expect(progress.values == [.init(completed: 4, total: 12)])
+            // The file holds the terms written before the failure and nothing from "b".
             let data = try Data(contentsOf: destination)
-            #expect(data == Data("aaaa".utf8))
+            #expect(data.prefix(4) == Data("aaaa".utf8))
+            #expect(data.count <= 12)
+            #expect(!data.contains(UInt8(ascii: "B")))
         }
     }
 
@@ -274,14 +371,26 @@ private final class ProgressRecorder: @unchecked Sendable {
     }
 }
 
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = 0
+
+    var value: Int {
+        get { lock.withLock { storage } }
+        set { lock.withLock { storage = newValue } }
+    }
+}
+
 private final class RequestRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var paths: [String: Int] = [:]
+    private var responses: [String: Int] = [:]
     private var chunkCount = 0
 
     var total: Int { lock.withLock { paths.values.reduce(0, +) } }
     var sentChunks: Int { lock.withLock { chunkCount } }
     func count(for path: String) -> Int { lock.withLock { paths[path, default: 0] } }
+    func responseCount(for path: String) -> Int { lock.withLock { responses[path, default: 0] } }
 
     func recordChunk() {
         lock.withLock { chunkCount += 1 }
@@ -292,6 +401,10 @@ private final class RequestRecorder: @unchecked Sendable {
             paths[path, default: 0] += 1
             return paths[path, default: 0]
         }
+    }
+
+    func recordResponse(_ path: String) {
+        lock.withLock { responses[path, default: 0] += 1 }
     }
 }
 
@@ -327,6 +440,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
     private let failFirstB: Bool
     private let delayB: TimeAmount
     private let streamedXorb: StreamedXorbFixture?
+    private let termRanges: [Range<Int>]?
     private let requests: RequestRecorder
 
     init(
@@ -336,6 +450,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         failFirstB: Bool,
         delayB: TimeAmount,
         streamedXorb: StreamedXorbFixture?,
+        termRanges: [Range<Int>]?,
         requests: RequestRecorder
     ) {
         self.hashes = hashes
@@ -344,7 +459,21 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         self.failFirstB = failFirstB
         self.delayB = delayB
         self.streamedXorb = streamedXorb
+        self.termRanges = termRanges
         self.requests = requests
+    }
+
+    /// Terms for the reconstruction response.
+    ///
+    /// `termRanges` describes terms that cover parts of the streamed xorb;
+    /// otherwise every term covers the whole fetch range.
+    private var terms: [CASClient.ReconstructionResponse.Term] {
+        if let termRanges, let streamedXorb {
+            let chunkSize = streamedXorb.output.count / streamedXorb.chunks.count
+            return termRanges.map { .init(hash: "a", unpackedLength: UInt32($0.count * chunkSize), range: $0) }
+        }
+        let chunkRange = 0 ..< (streamedXorb?.chunks.count ?? 1)
+        return hashes.map { .init(hash: $0, unpackedLength: unpackedLength, range: chunkRange) }
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -367,11 +496,12 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         } else if request.uri.hasPrefix("/v1/reconstructions/") {
             let chunkRange = 0 ..< (streamedXorb?.chunks.count ?? 1)
             let urlRange: ClosedRange<UInt64> = 0 ... UInt64((streamedXorb?.encodedByteCount ?? 12) - 1)
+            let terms = self.terms
             let reconstruction = CASClient.ReconstructionResponse(
                 offsetIntoFirstRange: offset,
-                terms: hashes.map { .init(hash: $0, unpackedLength: unpackedLength, range: chunkRange) },
+                terms: terms,
                 fetchInfo: Dictionary(
-                    uniqueKeysWithValues: Set(hashes).map {
+                    uniqueKeysWithValues: Set(terms.map(\.hash)).map {
                         ($0, [.init(url: "\(base)/\($0)", range: chunkRange, urlRange: urlRange)])
                     }
                 )
@@ -392,8 +522,11 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
             headers: HTTPHeaders([("Content-Length", "\(body.count)")])
         )
         let response = NIOLoopBound((context, head, body), eventLoop: context.eventLoop)
+        let requests = self.requests
+        let path = request.uri
         context.eventLoop.scheduleTask(in: request.uri == "/b" ? delayB : .nanoseconds(0)) {
             let (context, head, body) = response.value
+            requests.recordResponse(path)
             context.write(NIOAny(HTTPServerResponsePart.head(head)), promise: nil)
             context.write(NIOAny(HTTPServerResponsePart.body(.byteBuffer(ByteBuffer(bytes: body)))), promise: nil)
             context.writeAndFlush(NIOAny(HTTPServerResponsePart.end(nil)), promise: nil)
@@ -437,6 +570,8 @@ private func withFixture(
     failFirstB: Bool = false,
     delayB: TimeAmount = .nanoseconds(0),
     streamedXorb: StreamedXorbFixture? = nil,
+    termRanges: [Range<Int>]? = nil,
+    maxConcurrentFetches: Int = 1,
     _ body: (XetDownloader, RequestRecorder) async throws -> Void
 ) async throws {
     let requests = RequestRecorder()
@@ -452,6 +587,7 @@ private func withFixture(
                         failFirstB: failFirstB,
                         delayB: delayB,
                         streamedXorb: streamedXorb,
+                        termRanges: termRanges,
                         requests: requests
                     )
                 )
@@ -463,7 +599,7 @@ private func withFixture(
     configuration.enableMultipath = false
     configuration.poolSize = 1
     configuration.prewarmedConnections = 0
-    configuration.maxConcurrentFetches = 1
+    configuration.maxConcurrentFetches = maxConcurrentFetches
     configuration.autoScaleFetchConcurrency = false
     let url = URL(string: "http://127.0.0.1:\(channel.localAddress!.port!)/token")!
     do {
