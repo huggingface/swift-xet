@@ -6,8 +6,12 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions: {}
+
 jobs:
   test-macos:
+    permissions:
+      contents: read
     name: Swift ${{ matrix.swift }} on macOS ${{ matrix.macos }} with Xcode ${{ matrix.xcode }}
     runs-on: macos-${{ matrix.macos }}
     env:
@@ -47,6 +51,8 @@ jobs:
         run: swift test -v
 
   test-linux:
+    permissions:
+      contents: read
     name: Swift ${{ matrix.swift-version }} on Linux
     runs-on: ubuntu-latest
     strategy:
