@@ -131,6 +131,27 @@ struct DownloadProgressTests {
         }
     }
 
+    @Test func failedFetchReportsStatusCodeAndURL() async throws {
+        try await withFixture(failFirstB: true) { downloader, _ in
+            let error = await #expect(throws: XetDownloaderError.self) {
+                _ = try await downloader.data(for: Self.fileID)
+            }
+            #expect(error?.code == .fetchFailed)
+            #expect(error?.statusCode == 500)
+            #expect(error?.url?.path == "/b")
+        }
+    }
+
+    @Test func corruptChunkThrowsInvalidChunkData() async throws {
+        try await withFixture(corruptXorb: true) { downloader, _ in
+            let error = await #expect(throws: XetDownloaderError.self) {
+                _ = try await downloader.data(for: Self.fileID)
+            }
+            #expect(error?.code == .invalidChunkData)
+            #expect(error?.underlyingError as? XorbError == .unsupportedVersion(9))
+        }
+    }
+
     @Test func emptyReconstructionCompletes() async throws {
         try await withFixture(hashes: []) { downloader, _ in
             let progress = ProgressRecorder()
@@ -438,6 +459,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
     private let offset: UInt64
     private let unpackedLength: UInt32
     private let failFirstB: Bool
+    private let corruptXorb: Bool
     private let delayB: TimeAmount
     private let streamedXorb: StreamedXorbFixture?
     private let termRanges: [Range<Int>]?
@@ -448,6 +470,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         offset: UInt64,
         unpackedLength: UInt32,
         failFirstB: Bool,
+        corruptXorb: Bool,
         delayB: TimeAmount,
         streamedXorb: StreamedXorbFixture?,
         termRanges: [Range<Int>]?,
@@ -457,6 +480,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         self.offset = offset
         self.unpackedLength = unpackedLength
         self.failFirstB = failFirstB
+        self.corruptXorb = corruptXorb
         self.delayB = delayB
         self.streamedXorb = streamedXorb
         self.termRanges = termRanges
@@ -511,7 +535,9 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
             status = .internalServerError
             body = Data()
         } else if request.uri == "/a" || request.uri == "/b" {
-            body = Data([0, 4, 0, 0, 0, 4, 0, 0]) + Data((request.uri == "/a" ? "aaaa" : "BBBB").utf8)
+            // A version byte other than 0 makes the chunk header invalid.
+            let version: UInt8 = corruptXorb ? 9 : 0
+            body = Data([version, 4, 0, 0, 0, 4, 0, 0]) + Data((request.uri == "/a" ? "aaaa" : "BBBB").utf8)
         } else {
             status = .notFound
             body = Data()
@@ -568,6 +594,7 @@ private func withFixture(
     offset: UInt64 = 0,
     unpackedLength: UInt32 = 4,
     failFirstB: Bool = false,
+    corruptXorb: Bool = false,
     delayB: TimeAmount = .nanoseconds(0),
     streamedXorb: StreamedXorbFixture? = nil,
     termRanges: [Range<Int>]? = nil,
@@ -585,6 +612,7 @@ private func withFixture(
                         offset: offset,
                         unpackedLength: unpackedLength,
                         failFirstB: failFirstB,
+                        corruptXorb: corruptXorb,
                         delayB: delayB,
                         streamedXorb: streamedXorb,
                         termRanges: termRanges,

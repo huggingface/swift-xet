@@ -255,9 +255,7 @@ public final class XetDownloader: @unchecked Sendable {
     ///
     /// - Returns: The file contents, or the requested byte range.
     ///
-    /// - Throws: ``XetDownloaderError`` for protocol-level failures,
-    ///   ``XorbError`` for malformed chunk data,
-    ///   ``LZ4Error`` for decompression failures,
+    /// - Throws: ``XetDownloaderError`` for protocol failures and malformed data,
     ///   or `URLError` for network failures.
     ///
     /// - Important: This method loads the entire file (or range) into memory.
@@ -329,9 +327,7 @@ public final class XetDownloader: @unchecked Sendable {
     ///
     /// - Returns: The number of bytes written.
     ///
-    /// - Throws: ``XetDownloaderError`` for protocol-level failures,
-    ///   ``XorbError`` for malformed chunk data,
-    ///   ``LZ4Error`` for decompression failures,
+    /// - Throws: ``XetDownloaderError`` for protocol failures and malformed data,
     ///   `URLError` for network failures,
     ///   or file system errors if writing to disk fails.
     @discardableResult
@@ -766,7 +762,7 @@ public final class XetDownloader: @unchecked Sendable {
         sink: (_ ordinal: Int, _ chunk: UnsafeRawBufferPointer) throws -> Void
     ) async throws {
         guard let url = request.url else {
-            throw XetDownloaderError.fetchFailed(statusCode: nil, url: URL(fileURLWithPath: "/"))
+            throw XetDownloaderError.fetchFailed(statusCode: nil, url: nil)
         }
         let client = await httpClientPool.nextClient()
         var httpRequest = HTTPClientRequest(url: url.absoluteString)
@@ -811,7 +807,13 @@ public final class XetDownloader: @unchecked Sendable {
                 task.cancel()
             }
         }
-        try await decodeXorbStream(stream: stream, bufferSemaphore: bufferSemaphore, sink: sink)
+        do {
+            try await decodeXorbStream(stream: stream, bufferSemaphore: bufferSemaphore, sink: sink)
+        } catch let error as XorbError {
+            throw XetDownloaderError.invalidChunkData(error)
+        } catch let error as LZ4Error {
+            throw XetDownloaderError.invalidChunkData(error)
+        }
     }
 
     /// Decodes chunks from a xorb byte stream and hands each one to `sink`.
@@ -1085,71 +1087,212 @@ private actor HTTPClientPool {
 
 // MARK: - Errors
 
-/// Errors that can occur during Xet file downloads.
-public enum XetDownloaderError: Error, Sendable {
-    /// The token refresh request returned an invalid response.
-    case invalidTokenResponse
+/// An error that can occur during Xet file downloads.
+///
+/// Check ``code`` to find out what went wrong.
+/// New codes can be added in minor releases,
+/// so a `switch` over ``code`` needs a `default` case:
+///
+/// ```swift
+/// do {
+///     try await downloader.download(fileID, to: destination)
+/// } catch let error as XetDownloaderError {
+///     switch error.code {
+///     case .fetchFailed:
+///         print("Fetch failed with status \(error.statusCode ?? 0)")
+///     default:
+///         print(error.localizedDescription)
+///     }
+/// }
+/// ```
+public struct XetDownloaderError: Error, Sendable {
+    /// A code that identifies the kind of error.
+    public struct Code: Hashable, Sendable, CustomStringConvertible {
+        enum Base: String, Hashable, Sendable {
+            case invalidTokenResponse
+            case tokenRequestFailed
+            case invalidCASURL
+            case invalidReconstructionResponse
+            case reconstructionRequestFailed
+            case reconstructionDecodingFailed
+            case invalidReconstruction
+            case fetchFailed
+            case invalidFetchURL
+            case invalidFileID
+            case insecureURL
+            case invalidChunkData
+        }
 
-    /// The token refresh request failed with an HTTP error.
-    case tokenRequestFailed(statusCode: Int, body: Data)
+        let base: Base
 
-    /// The CAS URL in the token response could not be parsed.
-    case invalidCASURL(String)
+        private init(_ base: Base) {
+            self.base = base
+        }
 
-    /// The CAS reconstruction request returned an invalid response.
-    case invalidReconstructionResponse
+        /// The token refresh request returned an invalid response.
+        public static let invalidTokenResponse = Code(.invalidTokenResponse)
 
-    /// The CAS reconstruction request failed with an HTTP error.
-    case reconstructionRequestFailed(statusCode: Int, body: Data)
+        /// The token refresh request failed with an HTTP error.
+        public static let tokenRequestFailed = Code(.tokenRequestFailed)
 
-    /// Failed to decode the reconstruction response JSON.
-    case reconstructionDecodingFailed(Error)
+        /// The CAS URL in the token response could not be parsed.
+        public static let invalidCASURL = Code(.invalidCASURL)
 
-    /// The reconstruction response is malformed or missing required fetch info.
-    case invalidReconstruction
+        /// The CAS reconstruction request returned an invalid response.
+        public static let invalidReconstructionResponse = Code(.invalidReconstructionResponse)
 
-    /// The HTTP request to fetch xorb data failed.
-    case fetchFailed(statusCode: Int?, url: URL)
+        /// The CAS reconstruction request failed with an HTTP error.
+        public static let reconstructionRequestFailed = Code(.reconstructionRequestFailed)
 
-    /// The fetch info URL could not be parsed.
-    case invalidFetchURL(String)
+        /// The reconstruction response JSON could not be decoded.
+        public static let reconstructionDecodingFailed = Code(.reconstructionDecodingFailed)
 
-    /// The file ID is not a valid 64-character hex string.
-    case invalidFileID(String)
+        /// The reconstruction response is malformed or missing required fetch info.
+        public static let invalidReconstruction = Code(.invalidReconstruction)
 
-    /// A URL does not use HTTPS and insecure connections are not allowed.
-    case insecureURL(URL)
+        /// The HTTP request to fetch xorb data failed.
+        public static let fetchFailed = Code(.fetchFailed)
+
+        /// The fetch info URL could not be parsed.
+        public static let invalidFetchURL = Code(.invalidFetchURL)
+
+        /// The file ID is not a valid 64-character hex string.
+        public static let invalidFileID = Code(.invalidFileID)
+
+        /// A URL does not use HTTPS and insecure connections are not allowed.
+        public static let insecureURL = Code(.insecureURL)
+
+        /// The fetched xorb data has a malformed chunk or failed to decompress.
+        public static let invalidChunkData = Code(.invalidChunkData)
+
+        public var description: String {
+            base.rawValue
+        }
+    }
+
+    /// The kind of error.
+    public let code: Code
+
+    /// The HTTP status code of the failed request, if there is one.
+    public let statusCode: Int?
+
+    /// The body of the failed HTTP response, if there is one.
+    public let responseBody: Data?
+
+    /// The URL involved in the error, if there is one.
+    public let url: URL?
+
+    /// The value that could not be parsed, such as a URL string or a file ID.
+    public let invalidValue: String?
+
+    /// The error that caused this error, if there is one.
+    public let underlyingError: (any Error)?
+
+    init(
+        code: Code,
+        statusCode: Int? = nil,
+        responseBody: Data? = nil,
+        url: URL? = nil,
+        invalidValue: String? = nil,
+        underlyingError: (any Error)? = nil
+    ) {
+        self.code = code
+        self.statusCode = statusCode
+        self.responseBody = responseBody
+        self.url = url
+        self.invalidValue = invalidValue
+        self.underlyingError = underlyingError
+    }
+
+    static var invalidTokenResponse: Self {
+        Self(code: .invalidTokenResponse)
+    }
+
+    static func tokenRequestFailed(statusCode: Int, body: Data) -> Self {
+        Self(code: .tokenRequestFailed, statusCode: statusCode, responseBody: body)
+    }
+
+    static func invalidCASURL(_ value: String) -> Self {
+        Self(code: .invalidCASURL, invalidValue: value)
+    }
+
+    static var invalidReconstructionResponse: Self {
+        Self(code: .invalidReconstructionResponse)
+    }
+
+    static func reconstructionRequestFailed(statusCode: Int, body: Data) -> Self {
+        Self(code: .reconstructionRequestFailed, statusCode: statusCode, responseBody: body)
+    }
+
+    static func reconstructionDecodingFailed(_ error: any Error) -> Self {
+        Self(code: .reconstructionDecodingFailed, underlyingError: error)
+    }
+
+    static var invalidReconstruction: Self {
+        Self(code: .invalidReconstruction)
+    }
+
+    static func fetchFailed(statusCode: Int?, url: URL?) -> Self {
+        Self(code: .fetchFailed, statusCode: statusCode, url: url)
+    }
+
+    static func invalidFetchURL(_ value: String) -> Self {
+        Self(code: .invalidFetchURL, invalidValue: value)
+    }
+
+    static func invalidFileID(_ value: String) -> Self {
+        Self(code: .invalidFileID, invalidValue: value)
+    }
+
+    static func insecureURL(_ url: URL) -> Self {
+        Self(code: .insecureURL, url: url)
+    }
+
+    static func invalidChunkData(_ error: any Error) -> Self {
+        Self(code: .invalidChunkData, underlyingError: error)
+    }
 }
 
 extension XetDownloaderError: LocalizedError {
     public var errorDescription: String? {
-        switch self {
+        switch code.base {
         case .invalidTokenResponse:
             return "Token endpoint returned an invalid response."
-        case let .tokenRequestFailed(statusCode, _):
-            return "Token request failed with HTTP status \(statusCode)."
-        case let .invalidCASURL(url):
-            return "Invalid or insecure CAS URL: \(url)"
+        case .tokenRequestFailed:
+            return "Token request failed with HTTP status \(statusCode ?? 0)."
+        case .invalidCASURL:
+            return "Invalid or insecure CAS URL: \(invalidValue ?? "")"
         case .invalidReconstructionResponse:
             return "Reconstruction endpoint returned an invalid response."
-        case let .reconstructionRequestFailed(statusCode, _):
-            return "Reconstruction request failed with HTTP status \(statusCode)."
-        case let .reconstructionDecodingFailed(error):
-            return "Failed to decode reconstruction response: \(error.localizedDescription)"
+        case .reconstructionRequestFailed:
+            return "Reconstruction request failed with HTTP status \(statusCode ?? 0)."
+        case .reconstructionDecodingFailed:
+            return
+                "Failed to decode reconstruction response: \(underlyingError?.localizedDescription ?? "unknown error")"
         case .invalidReconstruction:
             return "Reconstruction response is malformed or missing required data."
-        case let .fetchFailed(statusCode, url):
-            if let code = statusCode {
-                return "Failed to fetch xorb data from \(url.host ?? "unknown"): HTTP \(code)"
+        case .fetchFailed:
+            let host = url?.host ?? "unknown"
+            if let statusCode {
+                return "Failed to fetch xorb data from \(host): HTTP \(statusCode)"
             }
-            return "Failed to fetch xorb data from \(url.host ?? "unknown")."
-        case let .invalidFetchURL(url):
-            return "Invalid fetch URL: \(url)"
-        case let .invalidFileID(id):
-            return "Invalid file ID (expected 64 hex characters): \(id.prefix(20))..."
-        case let .insecureURL(url):
-            return "Insecure URL not allowed: \(url). Set allowsInsecureConnections to true for local development."
+            return "Failed to fetch xorb data from \(host)."
+        case .invalidFetchURL:
+            return "Invalid fetch URL: \(invalidValue ?? "")"
+        case .invalidFileID:
+            return "Invalid file ID (expected 64 hex characters): \((invalidValue ?? "").prefix(20))..."
+        case .insecureURL:
+            return
+                "Insecure URL not allowed: \(url?.absoluteString ?? ""). Set allowsInsecureConnections to true for local development."
+        case .invalidChunkData:
+            return "Invalid xorb chunk data: \(underlyingError?.localizedDescription ?? "unknown error")"
         }
+    }
+}
+
+extension XetDownloaderError: CustomStringConvertible {
+    public var description: String {
+        errorDescription ?? "XetDownloaderError(\(code))"
     }
 }
 
