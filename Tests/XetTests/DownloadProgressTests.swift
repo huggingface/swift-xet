@@ -201,6 +201,17 @@ struct DownloadProgressTests {
         }
     }
 
+    @Test func droppedXorbConnectionThrowsTransportFailed() async throws {
+        try await withFixture(dropsXorbConnection: true) { downloader, _ in
+            let error = await downloaderError {
+                _ = try await downloader.data(for: Self.fileID)
+            }
+            #expect(error?.code == .transportFailed)
+            #expect(error?.url?.path == "/a")
+            #expect(error?.underlyingError != nil)
+        }
+    }
+
     @Test func emptyReconstructionCompletes() async throws {
         try await withFixture(hashes: []) { downloader, _ in
             let progress = ProgressRecorder()
@@ -531,6 +542,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
     private let failFirstB: Bool
     private let corruption: XorbCorruption?
     private let unreachable: UnreachableHost?
+    private let dropsXorbConnection: Bool
     private let delayB: TimeAmount
     private let streamedXorb: StreamedXorbFixture?
     private let termRanges: [Range<Int>]?
@@ -543,6 +555,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         failFirstB: Bool,
         corruption: XorbCorruption?,
         unreachable: UnreachableHost?,
+        dropsXorbConnection: Bool,
         delayB: TimeAmount,
         streamedXorb: StreamedXorbFixture?,
         termRanges: [Range<Int>]?,
@@ -554,6 +567,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         self.failFirstB = failFirstB
         self.corruption = corruption
         self.unreachable = unreachable
+        self.dropsXorbConnection = dropsXorbConnection
         self.delayB = delayB
         self.streamedXorb = streamedXorb
         self.termRanges = termRanges
@@ -633,9 +647,20 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         let response = NIOLoopBound((context, head, body), eventLoop: context.eventLoop)
         let requests = self.requests
         let path = request.uri
+        let dropsConnection = dropsXorbConnection && (path == "/a" || path == "/b")
         context.eventLoop.scheduleTask(in: request.uri == "/b" ? delayB : .nanoseconds(0)) {
             let (context, head, body) = response.value
             requests.recordResponse(path)
+            if dropsConnection {
+                // Send the head and part of the body, then close the connection.
+                context.write(NIOAny(HTTPServerResponsePart.head(head)), promise: nil)
+                context.writeAndFlush(
+                    NIOAny(HTTPServerResponsePart.body(.byteBuffer(ByteBuffer(bytes: body.prefix(4))))),
+                    promise: nil
+                )
+                context.close(promise: nil)
+                return
+            }
             context.write(NIOAny(HTTPServerResponsePart.head(head)), promise: nil)
             context.write(NIOAny(HTTPServerResponsePart.body(.byteBuffer(ByteBuffer(bytes: body)))), promise: nil)
             context.writeAndFlush(NIOAny(HTTPServerResponsePart.end(nil)), promise: nil)
@@ -679,6 +704,7 @@ private func withFixture(
     failFirstB: Bool = false,
     corruption: XorbCorruption? = nil,
     unreachable: UnreachableHost? = nil,
+    dropsXorbConnection: Bool = false,
     delayB: TimeAmount = .nanoseconds(0),
     streamedXorb: StreamedXorbFixture? = nil,
     termRanges: [Range<Int>]? = nil,
@@ -698,6 +724,7 @@ private func withFixture(
                         failFirstB: failFirstB,
                         corruption: corruption,
                         unreachable: unreachable,
+                        dropsXorbConnection: dropsXorbConnection,
                         delayB: delayB,
                         streamedXorb: streamedXorb,
                         termRanges: termRanges,
