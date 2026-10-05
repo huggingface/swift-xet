@@ -20,7 +20,7 @@ import NIOPosix
 
 /// Namespace for Xet download helpers.
 ///
-/// Use ``withDownloader(refreshURL:hubToken:configuration:_:)``
+/// Use ``withDownloader(refreshURL:hubToken:configuration:isolation:_:)``
 /// to create a downloader with a scoped lifetime,
 ///
 /// ## Usage
@@ -52,12 +52,28 @@ import NIOPosix
 /// skipping bytes at the start and truncating at the end as needed.
 public enum Xet {
     /// Creates a downloader for the duration of the closure, then shuts it down.
+    ///
+    /// The closure runs in the caller's isolation,
+    /// so it can use the caller's actor-isolated state,
+    /// such as properties of a `@MainActor` type.
+    /// The value it returns must be one the caller can take ownership of,
+    /// such as a `Sendable` value or a new object.
+    ///
+    /// - Parameters:
+    ///   - refreshURL: The Hugging Face Hub URL for obtaining CAS tokens.
+    ///   - hubToken: Optional Hugging Face Hub authentication token.
+    ///   - configuration: Downloader configuration.
+    ///   - isolation: The actor that the closure runs on.
+    ///     Defaults to the caller's actor.
+    ///   - body: A closure that uses the downloader.
+    /// - Returns: The value that `body` returns.
     public static func withDownloader<T>(
         refreshURL: URL,
         hubToken: String? = nil,
         configuration: XetDownloader.Configuration = .default,
-        _ body: (XetDownloader) async throws -> T
-    ) async throws -> T {
+        isolation: isolated (any Actor)? = #isolation,
+        _ body: (XetDownloader) async throws -> sending T
+    ) async throws -> sending T {
         let downloader = XetDownloader(
             refreshURL: refreshURL,
             hubToken: hubToken,
@@ -76,7 +92,7 @@ public enum Xet {
 
 /// Downloader for Hugging Face CAS files using the Xet protocol.
 ///
-/// Use ``Xet/withDownloader(refreshURL:hubToken:configuration:_:)``
+/// Use ``Xet/withDownloader(refreshURL:hubToken:configuration:isolation:_:)``
 /// to create a downloader with a scoped lifetime.
 /// If you instantiate directly,
 /// call ``shutdown()`` when you are done to release HTTP client resources.
@@ -158,7 +174,11 @@ public final class XetDownloader: @unchecked Sendable {
         ///   Tokens and file contents may be transmitted in plaintext.
         public var allowsInsecureConnections: Bool = false
 
+        /// The default configuration.
         public static let `default` = Configuration()
+
+        /// Creates a configuration with the default settings.
+        public init() {}
     }
 
     /// Creates a downloader configured for a specific repository.
@@ -383,7 +403,7 @@ public final class XetDownloader: @unchecked Sendable {
     ///
     /// Call this when you are done with the downloader to release resources.
     ///
-    /// - SeeAlso: ``Xet/withDownloader(refreshURL:hubToken:configuration:_:)`` for a more convenient way to create and use a downloader.
+    /// - SeeAlso: ``Xet/withDownloader(refreshURL:hubToken:configuration:isolation:_:)`` for a more convenient way to create and use a downloader.
     public func shutdown() async throws {
         try await httpClientPool.shutdown()
     }
