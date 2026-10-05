@@ -260,8 +260,8 @@ public final class XetDownloader: @unchecked Sendable {
     ///
     /// - Returns: The file contents, or the requested byte range.
     ///
-    /// - Throws: ``XetDownloaderError`` for protocol failures and malformed data,
-    ///   or `URLError` for network failures.
+    /// - Throws: ``XetDownloaderError``, with the `transportFailed` code
+    ///   for network failures, or `CancellationError` if the task is canceled.
     ///
     /// - Important: This method loads the entire file (or range) into memory.
     ///   For large files, use ``download(_:byteRange:to:fileManager:progress:)``
@@ -332,9 +332,9 @@ public final class XetDownloader: @unchecked Sendable {
     ///
     /// - Returns: The number of bytes written.
     ///
-    /// - Throws: ``XetDownloaderError`` for protocol failures and malformed data,
-    ///   `URLError` for network failures,
-    ///   or file system errors if writing to disk fails.
+    /// - Throws: ``XetDownloaderError``, with the `transportFailed` code
+    ///   for network failures; file system errors if writing to disk fails;
+    ///   or `CancellationError` if the task is canceled.
     @discardableResult
     public func download(
         _ fileID: String,
@@ -777,10 +777,12 @@ public final class XetDownloader: @unchecked Sendable {
                 httpRequest.headers.add(name: name, value: value)
             }
         }
-        let response = try await client.execute(
-            httpRequest,
-            timeout: .seconds(Int64(max(1, configuration.readTimeout)))
-        )
+        let response = try await withTransportErrors(url: url) {
+            try await client.execute(
+                httpRequest,
+                timeout: .seconds(Int64(max(1, configuration.readTimeout)))
+            )
+        }
         let statusCode = Int(response.status.code)
         guard (200 ..< 300).contains(statusCode) || statusCode == 206 else {
             throw XetDownloaderError.fetchFailed(statusCode: statusCode, url: url)
@@ -805,7 +807,7 @@ public final class XetDownloader: @unchecked Sendable {
                     }
                     continuation.finish()
                 } catch {
-                    continuation.finish(throwing: error)
+                    continuation.finish(throwing: XetDownloaderError.wrappingTransportError(error, url: url))
                 }
             }
             continuation.onTermination = { _ in
@@ -1125,6 +1127,7 @@ public struct XetDownloaderError: Error, Sendable {
             case invalidFileID
             case insecureURL
             case invalidChunkData
+            case transportFailed
         }
 
         let base: Base
@@ -1168,6 +1171,13 @@ public struct XetDownloaderError: Error, Sendable {
 
         /// The fetched xorb data has a malformed chunk or failed to decompress.
         public static let invalidChunkData = Code(.invalidChunkData)
+
+        /// A network request failed before a response arrived,
+        /// or while its body was being received.
+        ///
+        /// ``XetDownloaderError/underlyingError`` holds the error from the network stack,
+        /// such as a `URLError`.
+        public static let transportFailed = Code(.transportFailed)
 
         public var description: String {
             base.rawValue
@@ -1255,6 +1265,10 @@ public struct XetDownloaderError: Error, Sendable {
     static func invalidChunkData(_ error: any Error) -> Self {
         Self(code: .invalidChunkData, underlyingError: error)
     }
+
+    static func transportFailed(_ error: any Error, url: URL?) -> Self {
+        Self(code: .transportFailed, url: url, underlyingError: error)
+    }
 }
 
 extension XetDownloaderError: LocalizedError {
@@ -1290,6 +1304,9 @@ extension XetDownloaderError: LocalizedError {
                 "Insecure URL not allowed: \(url?.absoluteString ?? ""). Set allowsInsecureConnections to true for local development."
         case .invalidChunkData:
             return "Invalid xorb chunk data: \(underlyingError?.localizedDescription ?? "unknown error")"
+        case .transportFailed:
+            let host = url?.host ?? "unknown"
+            return "Network request to \(host) failed: \(underlyingError?.localizedDescription ?? "unknown error")"
         }
     }
 }
@@ -1297,6 +1314,36 @@ extension XetDownloaderError: LocalizedError {
 extension XetDownloaderError: CustomStringConvertible {
     public var description: String {
         errorDescription ?? "XetDownloaderError(\(code))"
+    }
+}
+
+/// Runs a network operation and wraps errors from the network stack
+/// in a ``XetDownloaderError`` with the `transportFailed` code.
+///
+/// Errors that are already ``XetDownloaderError`` values pass through,
+/// and cancellation surfaces as `CancellationError`.
+func withTransportErrors<T>(
+    url: URL?,
+    _ operation: () async throws -> T
+) async throws -> T {
+    do {
+        return try await operation()
+    } catch {
+        throw XetDownloaderError.wrappingTransportError(error, url: url)
+    }
+}
+
+extension XetDownloaderError {
+    /// Returns `error` unchanged if it's a ``XetDownloaderError`` or a cancellation,
+    /// and otherwise wraps it with the `transportFailed` code.
+    static func wrappingTransportError(_ error: any Error, url: URL?) -> any Error {
+        if error is XetDownloaderError || error is CancellationError {
+            return error
+        }
+        if Task.isCancelled {
+            return CancellationError()
+        }
+        return XetDownloaderError.transportFailed(error, url: url)
     }
 }
 
@@ -1381,7 +1428,9 @@ extension XetDownloader {
                     request.setValue("Bearer \(hubToken)", forHTTPHeaderField: "Authorization")
                 }
 
-                let (data, response) = try await urlSession.data(for: request)
+                let (data, response) = try await withTransportErrors(url: request.url) {
+                    try await urlSession.data(for: request)
+                }
                 guard let http = response as? HTTPURLResponse else {
                     throw XetDownloaderError.invalidTokenResponse
                 }

@@ -179,6 +179,28 @@ struct DownloadProgressTests {
         return nil
     }
 
+    @Test func unreachableCASThrowsTransportFailed() async throws {
+        try await withFixture(unreachable: .cas) { downloader, _ in
+            let error = await downloaderError {
+                _ = try await downloader.data(for: Self.fileID)
+            }
+            #expect(error?.code == .transportFailed)
+            #expect(error?.url?.port == 1)
+            #expect(error?.underlyingError is URLError)
+        }
+    }
+
+    @Test func unreachableXorbHostThrowsTransportFailed() async throws {
+        try await withFixture(unreachable: .xorbs) { downloader, _ in
+            let error = await downloaderError {
+                _ = try await downloader.data(for: Self.fileID)
+            }
+            #expect(error?.code == .transportFailed)
+            #expect(error?.url?.port == 1)
+            #expect(error?.underlyingError != nil)
+        }
+    }
+
     @Test func emptyReconstructionCompletes() async throws {
         try await withFixture(hashes: []) { downloader, _ in
             let progress = ProgressRecorder()
@@ -478,6 +500,18 @@ private struct StreamedXorbFixture: Sendable {
 }
 
 /// A way to make the fixture's xorb responses invalid.
+/// A fixture host that refuses connections.
+private enum UnreachableHost {
+    /// The token response points to a CAS server that isn't running.
+    case cas
+
+    /// The reconstruction points to xorb URLs on a host that isn't running.
+    case xorbs
+}
+
+/// A closed loopback port, used for hosts that refuse connections.
+private let closedPortBase = "http://127.0.0.1:1"
+
 private enum XorbCorruption {
     /// The chunk header has an unsupported version.
     case header
@@ -496,6 +530,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
     private let unpackedLength: UInt32
     private let failFirstB: Bool
     private let corruption: XorbCorruption?
+    private let unreachable: UnreachableHost?
     private let delayB: TimeAmount
     private let streamedXorb: StreamedXorbFixture?
     private let termRanges: [Range<Int>]?
@@ -507,6 +542,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         unpackedLength: UInt32,
         failFirstB: Bool,
         corruption: XorbCorruption?,
+        unreachable: UnreachableHost?,
         delayB: TimeAmount,
         streamedXorb: StreamedXorbFixture?,
         termRanges: [Range<Int>]?,
@@ -517,6 +553,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         self.unpackedLength = unpackedLength
         self.failFirstB = failFirstB
         self.corruption = corruption
+        self.unreachable = unreachable
         self.delayB = delayB
         self.streamedXorb = streamedXorb
         self.termRanges = termRanges
@@ -548,21 +585,23 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         var status = HTTPResponseStatus.ok
         let body: Data
         if request.uri == "/token" {
+            let casBase = unreachable == .cas ? closedPortBase : base
             body = Data(
                 """
-                {"accessToken":"fixture","exp":4102444800,"casUrl":"\(base)"}
+                {"accessToken":"fixture","exp":4102444800,"casUrl":"\(casBase)"}
                 """.utf8
             )
         } else if request.uri.hasPrefix("/v1/reconstructions/") {
             let chunkRange = 0 ..< (streamedXorb?.chunks.count ?? 1)
             let urlRange: ClosedRange<UInt64> = 0 ... UInt64((streamedXorb?.encodedByteCount ?? 12) - 1)
             let terms = self.terms
+            let xorbBase = unreachable == .xorbs ? closedPortBase : base
             let reconstruction = CASClient.ReconstructionResponse(
                 offsetIntoFirstRange: offset,
                 terms: terms,
                 fetchInfo: Dictionary(
                     uniqueKeysWithValues: Set(terms.map(\.hash)).map {
-                        ($0, [.init(url: "\(base)/\($0)", range: chunkRange, urlRange: urlRange)])
+                        ($0, [.init(url: "\(xorbBase)/\($0)", range: chunkRange, urlRange: urlRange)])
                     }
                 )
             )
@@ -639,6 +678,7 @@ private func withFixture(
     unpackedLength: UInt32 = 4,
     failFirstB: Bool = false,
     corruption: XorbCorruption? = nil,
+    unreachable: UnreachableHost? = nil,
     delayB: TimeAmount = .nanoseconds(0),
     streamedXorb: StreamedXorbFixture? = nil,
     termRanges: [Range<Int>]? = nil,
@@ -657,6 +697,7 @@ private func withFixture(
                         unpackedLength: unpackedLength,
                         failFirstB: failFirstB,
                         corruption: corruption,
+                        unreachable: unreachable,
                         delayB: delayB,
                         streamedXorb: streamedXorb,
                         termRanges: termRanges,
@@ -672,6 +713,11 @@ private func withFixture(
     configuration.poolSize = 1
     configuration.prewarmedConnections = 0
     configuration.maxConcurrentFetches = maxConcurrentFetches
+    if unreachable != nil {
+        // Fail refused connections right away instead of waiting for connectivity.
+        configuration.waitsForConnectivity = false
+        configuration.connectTimeout = 1
+    }
     configuration.autoScaleFetchConcurrency = false
     let url = URL(string: "http://127.0.0.1:\(channel.localAddress!.port!)/token")!
     do {
