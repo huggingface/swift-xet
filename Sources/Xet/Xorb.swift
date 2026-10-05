@@ -23,12 +23,12 @@ import Foundation
 ///     // Process uncompressed chunk data
 /// }
 /// ```
-public enum Xorb {
+enum Xorb {
     /// Decodes an async byte sequence into uncompressed chunks.
     ///
     /// - Parameter bytes: An async sequence of bytes representing xorb data.
     /// - Returns: An async sequence yielding uncompressed `Data` for each chunk.
-    public static func decode<S: AsyncSequence>(bytes: S) -> ChunkSequence<S>
+    static func decode<S: AsyncSequence>(bytes: S) -> ChunkSequence<S>
     where S.Element == UInt8 {
         ChunkSequence(
             source: bytes,
@@ -43,7 +43,7 @@ public enum Xorb {
     /// - Parameter data: The complete xorb payload.
     /// - Returns: All decoded chunks as decompressed `Data`, in order.
     /// - Throws: ``XorbError`` if the stream is malformed.
-    public static func decode(_ data: Data) throws -> [Data] {
+    static func decode(_ data: Data) throws -> [Data] {
         try data.withUnsafeBytes { raw in
             try decode(raw)
         }
@@ -54,7 +54,7 @@ public enum Xorb {
     /// - Parameter buffer: The complete xorb payload.
     /// - Returns: All decoded chunks as decompressed `Data`, in order.
     /// - Throws: ``XorbError`` if the stream is malformed.
-    public static func decode(_ buffer: UnsafeRawBufferPointer) throws -> [Data] {
+    static func decode(_ buffer: UnsafeRawBufferPointer) throws -> [Data] {
         var cursor = ByteCursor()
         cursor.append(contentsOf: buffer)
         var chunks: [Data] = []
@@ -71,7 +71,7 @@ public enum Xorb {
     }
 
     /// Compression schemes supported by the xorb format.
-    public enum CompressionScheme: UInt8, Sendable {
+    enum CompressionScheme: UInt8, Sendable {
         /// No compression; data stored as-is.
         case none = 0
 
@@ -86,15 +86,15 @@ public enum Xorb {
     }
 
     /// Parsed chunk header containing size and compression metadata.
-    public struct Header: Sendable, Equatable {
+    struct Header: Sendable, Equatable {
         /// Protocol version byte.
-        public let version: UInt8
+        let version: UInt8
         /// Compressed payload size in bytes.
-        public let compressedLength: Int
+        let compressedLength: Int
         /// Compression scheme for the payload.
-        public let compressionScheme: CompressionScheme
+        let compressionScheme: CompressionScheme
         /// Uncompressed payload size in bytes.
-        public let uncompressedLength: Int
+        let uncompressedLength: Int
     }
 
     /// Parses an 8-byte chunk header.
@@ -102,7 +102,7 @@ public enum Xorb {
     /// - Parameter bytes: Exactly 8 bytes of header data.
     /// - Returns: The parsed header.
     /// - Throws: ``XorbError`` if the header is invalid.
-    public static func parseHeader(_ data: Data) throws -> Header {
+    static func parseHeader(_ data: Data) throws -> Header {
         guard data.count == 8 else { throw XorbError.invalidLength }
         return try data.withUnsafeBytes { raw in
             try parseHeader(raw)
@@ -257,18 +257,18 @@ extension Xorb {
     ///
     /// Wraps a source byte or data stream and parses/decompresses chunks on demand.
     /// Each iteration yields the decompressed `Data` for one chunk.
-    public struct ChunkSequence<S: AsyncSequence>: AsyncSequence {
-        public typealias Element = Data
+    struct ChunkSequence<S: AsyncSequence>: AsyncSequence {
+        typealias Element = Data
 
         fileprivate let source: S
         fileprivate let appendElement: (S.Element, inout ByteCursor) -> Void
 
-        public func makeAsyncIterator() -> AsyncIterator {
+        func makeAsyncIterator() -> AsyncIterator {
             AsyncIterator(source: source, appendElement: appendElement)
         }
 
         /// The async iterator for xorb chunk decoding.
-        public struct AsyncIterator: AsyncIteratorProtocol {
+        struct AsyncIterator: AsyncIteratorProtocol {
             private var iterator: S.AsyncIterator
             private var cursor = ByteCursor()
             private var reachedEOF = false
@@ -283,7 +283,7 @@ extension Xorb {
             }
 
             /// Returns the next uncompressed chunk, or `nil` at end of stream.
-            public mutating func next() async throws -> Data? {
+            mutating func next() async throws -> Data? {
                 while true {
                     if let chunk = try Xorb.decodeNextChunk(from: &cursor) {
                         return chunk
@@ -309,7 +309,7 @@ extension Xorb {
 // MARK: - XorbError
 
 /// Errors that can occur during xorb chunk decoding.
-public enum XorbError: Error, Hashable, Sendable {
+enum XorbError: Error, Hashable, Sendable {
     /// The chunk header specifies an unsupported version.
     case unsupportedVersion(UInt8)
 
@@ -330,7 +330,7 @@ public enum XorbError: Error, Hashable, Sendable {
 }
 
 extension XorbError: LocalizedError {
-    public var errorDescription: String? {
+    var errorDescription: String? {
         switch self {
         case let .unsupportedVersion(version):
             return "Unsupported xorb chunk version: \(version)"
