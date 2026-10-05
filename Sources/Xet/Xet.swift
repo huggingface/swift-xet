@@ -143,8 +143,9 @@ public final class XetDownloader: @unchecked Sendable {
 
         /// Whether to enable multipath connections. Defaults to true.
         ///
-        /// Multipath TCP is available only through Network.framework,
-        /// so this setting has no effect on Linux.
+        /// The downloader uses Multipath TCP only through Network.framework.
+        /// Kernel support for Multipath TCP varies on Linux,
+        /// so this setting has no effect there.
         public var enableMultipath: Bool = true
 
         /// Whether to allow insecure (non-HTTPS) connections.
