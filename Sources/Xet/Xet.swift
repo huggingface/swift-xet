@@ -52,12 +52,28 @@ import NIOPosix
 /// skipping bytes at the start and truncating at the end as needed.
 public enum Xet {
     /// Creates a downloader for the duration of the closure, then shuts it down.
+    ///
+    /// The closure runs in the caller's isolation,
+    /// so it can use the caller's actor-isolated state,
+    /// such as properties of a `@MainActor` type.
+    /// The value it returns must be one the caller can take ownership of,
+    /// such as a `Sendable` value or a new object.
+    ///
+    /// - Parameters:
+    ///   - refreshURL: The Hugging Face Hub URL for obtaining CAS tokens.
+    ///   - hubToken: Optional Hugging Face Hub authentication token.
+    ///   - configuration: Downloader configuration.
+    ///   - isolation: The actor that the closure runs on.
+    ///     Defaults to the caller's actor.
+    ///   - body: A closure that uses the downloader.
+    /// - Returns: The value that `body` returns.
     public static func withDownloader<T>(
         refreshURL: URL,
         hubToken: String? = nil,
         configuration: XetDownloader.Configuration = .default,
-        _ body: (XetDownloader) async throws -> T
-    ) async throws -> T {
+        isolation: isolated (any Actor)? = #isolation,
+        _ body: (XetDownloader) async throws -> sending T
+    ) async throws -> sending T {
         let downloader = XetDownloader(
             refreshURL: refreshURL,
             hubToken: hubToken,
@@ -157,7 +173,11 @@ public final class XetDownloader: @unchecked Sendable {
         ///   Tokens and file contents may be transmitted in plaintext.
         public var allowsInsecureConnections: Bool = false
 
+        /// The default configuration.
         public static let `default` = Configuration()
+
+        /// Creates a configuration with the default settings.
+        public init() {}
     }
 
     /// Creates a downloader configured for a specific repository.
