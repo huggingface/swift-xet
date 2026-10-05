@@ -143,8 +143,8 @@ public final class XetDownloader: @unchecked Sendable {
 
         /// Whether to enable multipath connections. Defaults to true.
         ///
-        /// Some environments or network stacks may not support multipath and can
-        /// surface "Operation unsupported" connection failures if enabled.
+        /// Multipath TCP is available only through Network.framework,
+        /// so this setting has no effect on Linux.
         public var enableMultipath: Bool = true
 
         /// Whether to allow insecure (non-HTTPS) connections.
@@ -180,7 +180,11 @@ public final class XetDownloader: @unchecked Sendable {
             urlSession: .shared
         )
         self.casClient = CASClient(urlSession: .shared)
-        #if canImport(NIOTransportServices)
+        // Multipath TCP goes through Network.framework.
+        // NIOTransportServices also builds on Linux, where it has no Network.framework,
+        // so check for Network itself; on Linux this would request MPTCP sockets,
+        // which fail on kernels without MPTCP support.
+        #if canImport(Network)
             let effectiveEnableMultipath = configuration.enableMultipath
         #else
             let effectiveEnableMultipath = false
@@ -1030,12 +1034,11 @@ private actor HTTPClientPool {
         var created: [HTTPClient] = []
         created.reserveCapacity(poolSize)
         let group: EventLoopGroup
-        #if canImport(NIOTransportServices) && !os(Linux)
-            if configuration.enableMultipath {
-                group = NIOTSEventLoopGroup(loopCount: System.coreCount)
-            } else {
-                group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
-            }
+        // Use Network.framework wherever it's available,
+        // whether or not multipath is enabled,
+        // so options like `waitsForConnectivity` apply.
+        #if canImport(Network)
+            group = NIOTSEventLoopGroup(loopCount: System.coreCount)
         #else
             group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
         #endif
