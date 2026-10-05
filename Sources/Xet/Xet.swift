@@ -1091,6 +1091,30 @@ private actor HTTPClientPool {
     }
 }
 
+// MARK: - Renamed Settings
+
+// These names were renamed before 1.0.
+// They're unavailable so that existing code gets a fix-it for the new name.
+extension XetDownloader.Configuration {
+    @available(*, unavailable, renamed: "allowsMultipath")
+    public var enableMultipath: Bool {
+        get { fatalError("Use allowsMultipath") }
+        set { fatalError("Use allowsMultipath") }
+    }
+
+    @available(*, unavailable, renamed: "scalesFetchConcurrencyAutomatically")
+    public var autoScaleFetchConcurrency: Bool {
+        get { fatalError("Use scalesFetchConcurrencyAutomatically") }
+        set { fatalError("Use scalesFetchConcurrencyAutomatically") }
+    }
+
+    @available(*, unavailable, renamed: "maxInFlightBuffers")
+    public var maxInflightBuffers: Int {
+        get { fatalError("Use maxInFlightBuffers") }
+        set { fatalError("Use maxInFlightBuffers") }
+    }
+}
+
 // MARK: - Errors
 
 /// Errors that can occur during Xet file downloads.
