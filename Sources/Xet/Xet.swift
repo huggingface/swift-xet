@@ -817,8 +817,11 @@ public final class XetDownloader: @unchecked Sendable {
         do {
             try await decodeXorbStream(stream: stream, bufferSemaphore: bufferSemaphore, sink: sink)
         } catch let error as XorbError {
+            // A canceled fetch can end the stream partway through a chunk.
+            try Task.checkCancellation()
             throw XetDownloaderError.invalidChunkData(error)
         } catch let error as LZ4Error {
+            try Task.checkCancellation()
             throw XetDownloaderError.invalidChunkData(error)
         }
     }

@@ -369,7 +369,7 @@ struct DownloadProgressTests {
             }
             try #require(requests.count(for: "/b") == 1)
             task.cancel()
-            await #expect(throws: (any Error).self) { try await task.value }
+            await #expect(throws: CancellationError.self) { try await task.value }
             #expect(progress.values == [.init(completed: 4, total: 12)])
         }
     }
@@ -499,7 +499,6 @@ private struct StreamedXorbFixture: Sendable {
     }
 }
 
-/// A way to make the fixture's xorb responses invalid.
 /// A fixture host that refuses connections.
 private enum UnreachableHost {
     /// The token response points to a CAS server that isn't running.
@@ -512,6 +511,7 @@ private enum UnreachableHost {
 /// A closed loopback port, used for hosts that refuse connections.
 private let closedPortBase = "http://127.0.0.1:1"
 
+/// A way to make the fixture's xorb responses invalid.
 private enum XorbCorruption {
     /// The chunk header has an unsupported version.
     case header
