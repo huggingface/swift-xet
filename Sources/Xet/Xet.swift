@@ -20,7 +20,7 @@ import NIOPosix
 
 /// Namespace for Xet download helpers.
 ///
-/// Use ``withDownloader(refreshURL:hubToken:configuration:_:)``
+/// Use ``withDownloader(refreshURL:hubToken:configuration:isolation:_:)``
 /// to create a downloader with a scoped lifetime,
 ///
 /// ## Usage
@@ -92,7 +92,7 @@ public enum Xet {
 
 /// Downloader for Hugging Face CAS files using the Xet protocol.
 ///
-/// Use ``Xet/withDownloader(refreshURL:hubToken:configuration:_:)``
+/// Use ``Xet/withDownloader(refreshURL:hubToken:configuration:isolation:_:)``
 /// to create a downloader with a scoped lifetime.
 /// If you instantiate directly,
 /// call ``shutdown()`` when you are done to release HTTP client resources.
@@ -402,7 +402,7 @@ public final class XetDownloader: @unchecked Sendable {
     ///
     /// Call this when you are done with the downloader to release resources.
     ///
-    /// - SeeAlso: ``Xet/withDownloader(refreshURL:hubToken:configuration:_:)`` for a more convenient way to create and use a downloader.
+    /// - SeeAlso: ``Xet/withDownloader(refreshURL:hubToken:configuration:isolation:_:)`` for a more convenient way to create and use a downloader.
     public func shutdown() async throws {
         try await httpClientPool.shutdown()
     }
