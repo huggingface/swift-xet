@@ -113,7 +113,7 @@ public final class XetDownloader: @unchecked Sendable {
 
         /// Maximum number of received network buffers waiting to be decoded,
         /// per fetch. Defaults to 16.
-        public var maxInflightBuffers: Int = 16
+        public var maxInFlightBuffers: Int = 16
 
         /// Maximum concurrent HTTP/1 connections per host. Defaults to 24.
         public var connectionsPerHost: Int = 24
@@ -132,7 +132,7 @@ public final class XetDownloader: @unchecked Sendable {
 
         /// Whether to scale fetch concurrency based on connection pool size.
         /// Defaults to true.
-        public var autoScaleFetchConcurrency: Bool = true
+        public var scalesFetchConcurrencyAutomatically: Bool = true
 
         /// Whether to wait for network connectivity before failing.
         /// Defaults to true.
@@ -141,12 +141,16 @@ public final class XetDownloader: @unchecked Sendable {
         /// Idle timeout for pooled connections, in seconds. Defaults to 120.
         public var idleTimeout: TimeInterval = 120
 
-        /// Whether to enable multipath connections. Defaults to true.
+        /// Whether connections can use Multipath TCP. Defaults to false.
+        ///
+        /// When this is true, a connection can move to another interface,
+        /// such as cellular, if its primary interface is lost.
+        /// This works only with servers that support Multipath TCP.
         ///
         /// The downloader uses Multipath TCP only through Network.framework.
         /// Kernel support for Multipath TCP varies on Linux,
         /// so this setting has no effect there.
-        public var enableMultipath: Bool = true
+        public var allowsMultipath: Bool = false
 
         /// Whether to allow insecure (non-HTTPS) connections.
         ///
@@ -186,9 +190,9 @@ public final class XetDownloader: @unchecked Sendable {
         // so check for Network itself; on Linux this would request MPTCP sockets,
         // which fail on kernels without MPTCP support.
         #if canImport(Network)
-            let effectiveEnableMultipath = configuration.enableMultipath
+            let effectiveAllowsMultipath = configuration.allowsMultipath
         #else
-            let effectiveEnableMultipath = false
+            let effectiveAllowsMultipath = false
         #endif
         var httpConfiguration = HTTPClient.Configuration()
         httpConfiguration.httpVersion = .http1Only
@@ -206,7 +210,7 @@ public final class XetDownloader: @unchecked Sendable {
             min(configuration.prewarmedConnections, configuration.connectionsPerHost)
         )
         httpConfiguration.networkFrameworkWaitForConnectivity = configuration.waitsForConnectivity
-        httpConfiguration.enableMultipath = effectiveEnableMultipath
+        httpConfiguration.enableMultipath = effectiveAllowsMultipath
         self.httpClientPool = HTTPClientPool(
             configuration: httpConfiguration,
             size: configuration.poolSize
@@ -394,10 +398,10 @@ public final class XetDownloader: @unchecked Sendable {
 
     // MARK: -
 
-    /// The fetch concurrency limit after applying `autoScaleFetchConcurrency`.
+    /// The fetch concurrency limit after applying `scalesFetchConcurrencyAutomatically`.
     private var maxConcurrentFetches: Int {
         let configured = max(1, configuration.maxConcurrentFetches)
-        guard configuration.autoScaleFetchConcurrency else {
+        guard configuration.scalesFetchConcurrencyAutomatically else {
             return configured
         }
         let poolSize = max(1, configuration.poolSize)
@@ -792,7 +796,7 @@ public final class XetDownloader: @unchecked Sendable {
         let bufferSlots = max(
             2,
             min(
-                max(1, configuration.maxInflightBuffers),
+                max(1, configuration.maxInFlightBuffers),
                 max(1, configuration.maxConcurrentDecodes)
             )
         )
