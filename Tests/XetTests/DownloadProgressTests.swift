@@ -736,7 +736,6 @@ private func withFixture(
         .bind(host: "127.0.0.1", port: 0).get()
     var configuration = XetDownloader.Configuration.default
     configuration.allowsInsecureConnections = true
-    configuration.enableMultipath = false
     configuration.poolSize = 1
     configuration.prewarmedConnections = 0
     configuration.maxConcurrentFetches = maxConcurrentFetches
@@ -745,7 +744,7 @@ private func withFixture(
         configuration.waitsForConnectivity = false
         configuration.connectTimeout = 1
     }
-    configuration.autoScaleFetchConcurrency = false
+    configuration.scalesFetchConcurrencyAutomatically = false
     let url = URL(string: "http://127.0.0.1:\(channel.localAddress!.port!)/token")!
     do {
         try await Xet.withDownloader(refreshURL: url, configuration: configuration) { downloader in
