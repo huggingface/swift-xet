@@ -20,7 +20,7 @@ import Foundation
 ///
 /// - SeeAlso: [LZ4 Block Format](https://github.com/lz4/lz4/blob/dev/doc/lz4_Block_format.md)
 /// - SeeAlso: [LZ4 Frame Format](https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md)
-public enum LZ4 {
+enum LZ4 {
     /// Decompresses an LZ4 block with a known uncompressed size.
     ///
     /// Automatically detects whether the input is a raw block
@@ -32,7 +32,7 @@ public enum LZ4 {
     ///
     /// - Returns: The decompressed data.
     /// - Throws: ``LZ4Error`` if decompression fails or size doesn't match.
-    public static func decompressBlock(_ compressed: Data, uncompressedLength: Int) throws -> Data {
+    static func decompressBlock(_ compressed: Data, uncompressedLength: Int) throws -> Data {
         guard uncompressedLength > 0 else { return Data() }
 
         return try compressed.withUnsafeBytes { srcBuffer in
@@ -48,7 +48,7 @@ public enum LZ4 {
     ///
     /// - Returns: The decompressed data.
     /// - Throws: ``LZ4Error`` if decompression fails or size doesn't match.
-    public static func decompressBlock(
+    static func decompressBlock(
         _ compressed: UnsafeRawBufferPointer,
         uncompressedLength: Int
     ) throws -> Data {
@@ -88,7 +88,7 @@ public enum LZ4 {
     ///
     /// - Returns: The number of bytes written to output.
     /// - Throws: ``LZ4Error`` if decompression fails.
-    public static func decompressBlock(
+    static func decompressBlock(
         _ compressed: UnsafeRawBufferPointer,
         uncompressedLength: Int,
         output: UnsafeMutableRawBufferPointer
@@ -132,7 +132,7 @@ public enum LZ4 {
     ///
     /// - Returns: The decompressed data.
     /// - Throws: ``LZ4Error`` if decompression fails.
-    public static func decompressRawBlock(_ compressed: Data, maxOutputSize: Int) throws -> Data {
+    static func decompressRawBlock(_ compressed: Data, maxOutputSize: Int) throws -> Data {
         guard maxOutputSize > 0 else { return Data() }
 
         return try compressed.withUnsafeBytes { srcBuffer in
@@ -151,7 +151,7 @@ public enum LZ4 {
     ///
     /// - Returns: The number of bytes written to output.
     /// - Throws: ``LZ4Error`` if decompression fails.
-    public static func decompressRawBlock(
+    static func decompressRawBlock(
         _ compressed: UnsafeRawBufferPointer,
         output: UnsafeMutableRawBufferPointer
     ) throws -> Int {
@@ -201,7 +201,7 @@ public enum LZ4 {
     ///
     /// - Returns: The decompressed data.
     /// - Throws: ``LZ4Error`` if decompression fails.
-    public static func decompressRawBlock(
+    static func decompressRawBlock(
         _ compressed: UnsafeRawBufferPointer,
         maxOutputSize: Int
     ) throws -> Data {
@@ -397,7 +397,7 @@ public enum LZ4 {
 // MARK: - Errors
 
 /// Errors that can occur during LZ4 decompression.
-public enum LZ4Error: Swift.Error, Sendable, Equatable {
+enum LZ4Error: Swift.Error, Sendable, Equatable {
     /// Decompression failed or output size doesn't match expected.
     case decompressionFailed
 
@@ -406,7 +406,7 @@ public enum LZ4Error: Swift.Error, Sendable, Equatable {
 }
 
 extension LZ4Error: LocalizedError {
-    public var errorDescription: String? {
+    var errorDescription: String? {
         switch self {
         case .decompressionFailed:
             return "LZ4 decompression failed or output size mismatch."

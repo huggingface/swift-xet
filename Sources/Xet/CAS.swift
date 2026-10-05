@@ -48,7 +48,9 @@ struct CASClient: Sendable {
             request.setValue(byteRange.httpRangeHeaderValue, forHTTPHeaderField: "Range")
         }
 
-        let (data, response) = try await urlSession.data(for: request)
+        let (data, response) = try await withTransportErrors(url: url) {
+            try await urlSession.data(for: request)
+        }
         guard let http = response as? HTTPURLResponse else {
             throw XetDownloaderError.invalidReconstructionResponse
         }

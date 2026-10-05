@@ -131,6 +131,87 @@ struct DownloadProgressTests {
         }
     }
 
+    @Test func failedFetchReportsStatusCodeAndURL() async throws {
+        try await withFixture(failFirstB: true) { downloader, _ in
+            let error = await downloaderError {
+                _ = try await downloader.data(for: Self.fileID)
+            }
+            #expect(error?.code == .fetchFailed)
+            #expect(error?.statusCode == 500)
+            #expect(error?.url?.path == "/b")
+        }
+    }
+
+    @Test func invalidChunkHeaderThrowsInvalidChunkData() async throws {
+        try await withFixture(corruption: .header) { downloader, _ in
+            let error = await downloaderError {
+                _ = try await downloader.data(for: Self.fileID)
+            }
+            #expect(error?.code == .invalidChunkData)
+            #expect(error?.underlyingError as? XorbError == .unsupportedVersion(9))
+        }
+    }
+
+    @Test func invalidLZ4PayloadThrowsInvalidChunkData() async throws {
+        try await withFixture(corruption: .lz4Payload) { downloader, _ in
+            let error = await downloaderError {
+                _ = try await downloader.data(for: Self.fileID)
+            }
+            #expect(error?.code == .invalidChunkData)
+            #expect(error?.underlyingError is LZ4Error)
+        }
+    }
+
+    /// Returns the `XetDownloaderError` that `body` throws,
+    /// and records an issue if it throws another error or none.
+    ///
+    /// Swift 6.0's `#expect(throws:)` doesn't return the error,
+    /// so the tests that inspect it use this instead.
+    private func downloaderError(_ body: () async throws -> Void) async -> XetDownloaderError? {
+        do {
+            try await body()
+            Issue.record("Expected a XetDownloaderError, but nothing was thrown")
+        } catch let error as XetDownloaderError {
+            return error
+        } catch {
+            Issue.record("Expected a XetDownloaderError, but \(error) was thrown")
+        }
+        return nil
+    }
+
+    @Test func unreachableCASThrowsTransportFailed() async throws {
+        try await withFixture(unreachable: .cas) { downloader, _ in
+            let error = await downloaderError {
+                _ = try await downloader.data(for: Self.fileID)
+            }
+            #expect(error?.code == .transportFailed)
+            #expect(error?.url?.port == 1)
+            #expect(error?.underlyingError is URLError)
+        }
+    }
+
+    @Test func unreachableXorbHostThrowsTransportFailed() async throws {
+        try await withFixture(unreachable: .xorbs) { downloader, _ in
+            let error = await downloaderError {
+                _ = try await downloader.data(for: Self.fileID)
+            }
+            #expect(error?.code == .transportFailed)
+            #expect(error?.url?.port == 1)
+            #expect(error?.underlyingError != nil)
+        }
+    }
+
+    @Test func droppedXorbConnectionThrowsTransportFailed() async throws {
+        try await withFixture(dropsXorbConnection: true) { downloader, _ in
+            let error = await downloaderError {
+                _ = try await downloader.data(for: Self.fileID)
+            }
+            #expect(error?.code == .transportFailed)
+            #expect(error?.url?.path == "/a")
+            #expect(error?.underlyingError != nil)
+        }
+    }
+
     @Test func emptyReconstructionCompletes() async throws {
         try await withFixture(hashes: []) { downloader, _ in
             let progress = ProgressRecorder()
@@ -299,7 +380,7 @@ struct DownloadProgressTests {
             }
             try #require(requests.count(for: "/b") == 1)
             task.cancel()
-            await #expect(throws: (any Error).self) { try await task.value }
+            await #expect(throws: CancellationError.self) { try await task.value }
             #expect(progress.values == [.init(completed: 4, total: 12)])
         }
     }
@@ -429,6 +510,27 @@ private struct StreamedXorbFixture: Sendable {
     }
 }
 
+/// A fixture host that refuses connections.
+private enum UnreachableHost {
+    /// The token response points to a CAS server that isn't running.
+    case cas
+
+    /// The reconstruction points to xorb URLs on a host that isn't running.
+    case xorbs
+}
+
+/// A closed loopback port, used for hosts that refuse connections.
+private let closedPortBase = "http://127.0.0.1:1"
+
+/// A way to make the fixture's xorb responses invalid.
+private enum XorbCorruption {
+    /// The chunk header has an unsupported version.
+    case header
+
+    /// The chunk header is valid, but its LZ4 payload can't be decompressed.
+    case lz4Payload
+}
+
 /// Serves token, reconstruction, and uncompressed xorb responses over loopback.
 private final class FixtureHandler: ChannelInboundHandler, Sendable {
     typealias InboundIn = HTTPServerRequestPart
@@ -438,6 +540,9 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
     private let offset: UInt64
     private let unpackedLength: UInt32
     private let failFirstB: Bool
+    private let corruption: XorbCorruption?
+    private let unreachable: UnreachableHost?
+    private let dropsXorbConnection: Bool
     private let delayB: TimeAmount
     private let streamedXorb: StreamedXorbFixture?
     private let termRanges: [Range<Int>]?
@@ -448,6 +553,9 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         offset: UInt64,
         unpackedLength: UInt32,
         failFirstB: Bool,
+        corruption: XorbCorruption?,
+        unreachable: UnreachableHost?,
+        dropsXorbConnection: Bool,
         delayB: TimeAmount,
         streamedXorb: StreamedXorbFixture?,
         termRanges: [Range<Int>]?,
@@ -457,6 +565,9 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         self.offset = offset
         self.unpackedLength = unpackedLength
         self.failFirstB = failFirstB
+        self.corruption = corruption
+        self.unreachable = unreachable
+        self.dropsXorbConnection = dropsXorbConnection
         self.delayB = delayB
         self.streamedXorb = streamedXorb
         self.termRanges = termRanges
@@ -488,21 +599,23 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         var status = HTTPResponseStatus.ok
         let body: Data
         if request.uri == "/token" {
+            let casBase = unreachable == .cas ? closedPortBase : base
             body = Data(
                 """
-                {"accessToken":"fixture","exp":4102444800,"casUrl":"\(base)"}
+                {"accessToken":"fixture","exp":4102444800,"casUrl":"\(casBase)"}
                 """.utf8
             )
         } else if request.uri.hasPrefix("/v1/reconstructions/") {
             let chunkRange = 0 ..< (streamedXorb?.chunks.count ?? 1)
             let urlRange: ClosedRange<UInt64> = 0 ... UInt64((streamedXorb?.encodedByteCount ?? 12) - 1)
             let terms = self.terms
+            let xorbBase = unreachable == .xorbs ? closedPortBase : base
             let reconstruction = CASClient.ReconstructionResponse(
                 offsetIntoFirstRange: offset,
                 terms: terms,
                 fetchInfo: Dictionary(
                     uniqueKeysWithValues: Set(terms.map(\.hash)).map {
-                        ($0, [.init(url: "\(base)/\($0)", range: chunkRange, urlRange: urlRange)])
+                        ($0, [.init(url: "\(xorbBase)/\($0)", range: chunkRange, urlRange: urlRange)])
                     }
                 )
             )
@@ -511,7 +624,17 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
             status = .internalServerError
             body = Data()
         } else if request.uri == "/a" || request.uri == "/b" {
-            body = Data([0, 4, 0, 0, 0, 4, 0, 0]) + Data((request.uri == "/a" ? "aaaa" : "BBBB").utf8)
+            switch corruption {
+            case .header:
+                // A version byte other than 0 makes the chunk header invalid.
+                body = Data([9, 4, 0, 0, 0, 4, 0, 0]) + Data("aaaa".utf8)
+            case .lz4Payload:
+                // A valid LZ4 chunk header followed by a match whose offset
+                // points before the start of the output.
+                body = Data([0, 4, 0, 0, 1, 4, 0, 0]) + Data([0x10, 0x61, 0x05, 0x00])
+            case nil:
+                body = Data([0, 4, 0, 0, 0, 4, 0, 0]) + Data((request.uri == "/a" ? "aaaa" : "BBBB").utf8)
+            }
         } else {
             status = .notFound
             body = Data()
@@ -524,9 +647,20 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         let response = NIOLoopBound((context, head, body), eventLoop: context.eventLoop)
         let requests = self.requests
         let path = request.uri
+        let dropsConnection = dropsXorbConnection && (path == "/a" || path == "/b")
         context.eventLoop.scheduleTask(in: request.uri == "/b" ? delayB : .nanoseconds(0)) {
             let (context, head, body) = response.value
             requests.recordResponse(path)
+            if dropsConnection {
+                // Send the head and part of the body, then close the connection.
+                context.write(NIOAny(HTTPServerResponsePart.head(head)), promise: nil)
+                context.writeAndFlush(
+                    NIOAny(HTTPServerResponsePart.body(.byteBuffer(ByteBuffer(bytes: body.prefix(4))))),
+                    promise: nil
+                )
+                context.close(promise: nil)
+                return
+            }
             context.write(NIOAny(HTTPServerResponsePart.head(head)), promise: nil)
             context.write(NIOAny(HTTPServerResponsePart.body(.byteBuffer(ByteBuffer(bytes: body)))), promise: nil)
             context.writeAndFlush(NIOAny(HTTPServerResponsePart.end(nil)), promise: nil)
@@ -568,6 +702,9 @@ private func withFixture(
     offset: UInt64 = 0,
     unpackedLength: UInt32 = 4,
     failFirstB: Bool = false,
+    corruption: XorbCorruption? = nil,
+    unreachable: UnreachableHost? = nil,
+    dropsXorbConnection: Bool = false,
     delayB: TimeAmount = .nanoseconds(0),
     streamedXorb: StreamedXorbFixture? = nil,
     termRanges: [Range<Int>]? = nil,
@@ -585,6 +722,9 @@ private func withFixture(
                         offset: offset,
                         unpackedLength: unpackedLength,
                         failFirstB: failFirstB,
+                        corruption: corruption,
+                        unreachable: unreachable,
+                        dropsXorbConnection: dropsXorbConnection,
                         delayB: delayB,
                         streamedXorb: streamedXorb,
                         termRanges: termRanges,
@@ -600,6 +740,11 @@ private func withFixture(
     configuration.poolSize = 1
     configuration.prewarmedConnections = 0
     configuration.maxConcurrentFetches = maxConcurrentFetches
+    if unreachable != nil {
+        // Fail refused connections right away instead of waiting for connectivity.
+        configuration.waitsForConnectivity = false
+        configuration.connectTimeout = 1
+    }
     configuration.autoScaleFetchConcurrency = false
     let url = URL(string: "http://127.0.0.1:\(channel.localAddress!.port!)/token")!
     do {

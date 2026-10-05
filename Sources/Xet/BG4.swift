@@ -25,7 +25,7 @@ import Foundation
 /// The xorb format uses BG4 with the `byteGrouping4LZ4` compression scheme.
 /// Decoding applies LZ4 decompression first,
 /// then ``regroup(_:)`` to restore the original byte order.
-public enum BG4 {
+enum BG4 {
     /// Restores interleaved byte order from BG4-grouped data.
     ///
     /// Reverses the BG4 split operation:
@@ -37,7 +37,7 @@ public enum BG4 {
     ///
     /// - Parameter grouped: Data with bytes grouped by position mod 4.
     /// - Returns: Data with original interleaved byte order restored.
-    public static func regroup(_ grouped: Data) -> Data {
+    static func regroup(_ grouped: Data) -> Data {
         let n = grouped.count
         guard n > 0 else { return Data() }
 
@@ -55,7 +55,7 @@ public enum BG4 {
     /// - Parameters:
     ///   - grouped: Source buffer with bytes grouped by position mod 4.
     ///   - output: Destination buffer (must be at least as large as source).
-    public static func regroup(
+    static func regroup(
         _ grouped: UnsafeRawBufferPointer,
         into output: UnsafeMutableRawBufferPointer
     ) {
