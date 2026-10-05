@@ -133,7 +133,7 @@ struct DownloadProgressTests {
 
     @Test func failedFetchReportsStatusCodeAndURL() async throws {
         try await withFixture(failFirstB: true) { downloader, _ in
-            let error = await #expect(throws: XetDownloaderError.self) {
+            let error = await downloaderError {
                 _ = try await downloader.data(for: Self.fileID)
             }
             #expect(error?.code == .fetchFailed)
@@ -142,14 +142,41 @@ struct DownloadProgressTests {
         }
     }
 
-    @Test func corruptChunkThrowsInvalidChunkData() async throws {
-        try await withFixture(corruptXorb: true) { downloader, _ in
-            let error = await #expect(throws: XetDownloaderError.self) {
+    @Test func invalidChunkHeaderThrowsInvalidChunkData() async throws {
+        try await withFixture(corruption: .header) { downloader, _ in
+            let error = await downloaderError {
                 _ = try await downloader.data(for: Self.fileID)
             }
             #expect(error?.code == .invalidChunkData)
             #expect(error?.underlyingError as? XorbError == .unsupportedVersion(9))
         }
+    }
+
+    @Test func invalidLZ4PayloadThrowsInvalidChunkData() async throws {
+        try await withFixture(corruption: .lz4Payload) { downloader, _ in
+            let error = await downloaderError {
+                _ = try await downloader.data(for: Self.fileID)
+            }
+            #expect(error?.code == .invalidChunkData)
+            #expect(error?.underlyingError is LZ4Error)
+        }
+    }
+
+    /// Returns the `XetDownloaderError` that `body` throws,
+    /// and records an issue if it throws another error or none.
+    ///
+    /// Swift 6.0's `#expect(throws:)` doesn't return the error,
+    /// so the tests that inspect it use this instead.
+    private func downloaderError(_ body: () async throws -> Void) async -> XetDownloaderError? {
+        do {
+            try await body()
+            Issue.record("Expected a XetDownloaderError, but nothing was thrown")
+        } catch let error as XetDownloaderError {
+            return error
+        } catch {
+            Issue.record("Expected a XetDownloaderError, but \(error) was thrown")
+        }
+        return nil
     }
 
     @Test func emptyReconstructionCompletes() async throws {
@@ -450,6 +477,15 @@ private struct StreamedXorbFixture: Sendable {
     }
 }
 
+/// A way to make the fixture's xorb responses invalid.
+private enum XorbCorruption {
+    /// The chunk header has an unsupported version.
+    case header
+
+    /// The chunk header is valid, but its LZ4 payload can't be decompressed.
+    case lz4Payload
+}
+
 /// Serves token, reconstruction, and uncompressed xorb responses over loopback.
 private final class FixtureHandler: ChannelInboundHandler, Sendable {
     typealias InboundIn = HTTPServerRequestPart
@@ -459,7 +495,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
     private let offset: UInt64
     private let unpackedLength: UInt32
     private let failFirstB: Bool
-    private let corruptXorb: Bool
+    private let corruption: XorbCorruption?
     private let delayB: TimeAmount
     private let streamedXorb: StreamedXorbFixture?
     private let termRanges: [Range<Int>]?
@@ -470,7 +506,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         offset: UInt64,
         unpackedLength: UInt32,
         failFirstB: Bool,
-        corruptXorb: Bool,
+        corruption: XorbCorruption?,
         delayB: TimeAmount,
         streamedXorb: StreamedXorbFixture?,
         termRanges: [Range<Int>]?,
@@ -480,7 +516,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         self.offset = offset
         self.unpackedLength = unpackedLength
         self.failFirstB = failFirstB
-        self.corruptXorb = corruptXorb
+        self.corruption = corruption
         self.delayB = delayB
         self.streamedXorb = streamedXorb
         self.termRanges = termRanges
@@ -535,9 +571,17 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
             status = .internalServerError
             body = Data()
         } else if request.uri == "/a" || request.uri == "/b" {
-            // A version byte other than 0 makes the chunk header invalid.
-            let version: UInt8 = corruptXorb ? 9 : 0
-            body = Data([version, 4, 0, 0, 0, 4, 0, 0]) + Data((request.uri == "/a" ? "aaaa" : "BBBB").utf8)
+            switch corruption {
+            case .header:
+                // A version byte other than 0 makes the chunk header invalid.
+                body = Data([9, 4, 0, 0, 0, 4, 0, 0]) + Data("aaaa".utf8)
+            case .lz4Payload:
+                // A valid LZ4 chunk header followed by a match whose offset
+                // points before the start of the output.
+                body = Data([0, 4, 0, 0, 1, 4, 0, 0]) + Data([0x10, 0x61, 0x05, 0x00])
+            case nil:
+                body = Data([0, 4, 0, 0, 0, 4, 0, 0]) + Data((request.uri == "/a" ? "aaaa" : "BBBB").utf8)
+            }
         } else {
             status = .notFound
             body = Data()
@@ -594,7 +638,7 @@ private func withFixture(
     offset: UInt64 = 0,
     unpackedLength: UInt32 = 4,
     failFirstB: Bool = false,
-    corruptXorb: Bool = false,
+    corruption: XorbCorruption? = nil,
     delayB: TimeAmount = .nanoseconds(0),
     streamedXorb: StreamedXorbFixture? = nil,
     termRanges: [Range<Int>]? = nil,
@@ -612,7 +656,7 @@ private func withFixture(
                         offset: offset,
                         unpackedLength: unpackedLength,
                         failFirstB: failFirstB,
-                        corruptXorb: corruptXorb,
+                        corruption: corruption,
                         delayB: delayB,
                         streamedXorb: streamedXorb,
                         termRanges: termRanges,
