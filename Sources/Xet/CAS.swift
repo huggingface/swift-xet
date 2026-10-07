@@ -3,6 +3,8 @@ import Foundation
     import FoundationNetworking
 #endif
 
+import NIOConcurrencyHelpers
+
 /// Client for the Xet Content Addressable Storage (CAS) reconstruction API.
 ///
 /// The CAS server stores file data as deduplicated, compressed chunks
@@ -10,6 +12,21 @@ import Foundation
 /// that describes how to reassemble a file from its constituent chunks.
 struct CASClient: Sendable {
     private let urlSession: URLSession
+
+    /// The reconstruction API version to request first.
+    ///
+    /// The client asks for version 2 until a server answers only version 1,
+    /// then uses version 1 for later requests.
+    private let reconstructionAPIVersion = NIOLockedValueBox(ReconstructionAPIVersion.v2)
+
+    /// A version of the reconstruction API.
+    enum ReconstructionAPIVersion: String, Sendable {
+        /// The deprecated `/v1/reconstructions` endpoint.
+        case v1
+
+        /// The `/v2/reconstructions` endpoint.
+        case v2
+    }
 
     /// Creates a CAS client with the specified URL session.
     init(urlSession: URLSession = .shared) {
@@ -22,6 +39,13 @@ struct CASClient: Sendable {
     /// - An ordered list of terms, each referencing a chunk range within a xorb
     /// - Fetch info with presigned URLs for downloading xorb data
     /// - An offset for partial range requests
+    ///
+    /// The client uses the version 2 endpoint.
+    /// If the server answers it with HTTP 404 or 501,
+    /// the client uses the deprecated version 1 endpoint,
+    /// as the Xet protocol recommends.
+    /// Each byte range in a version 2 response becomes its own fetch info,
+    /// so the downloader fetches one range per request.
     ///
     /// - Parameters:
     ///   - fileID: The 64-character hex file identifier (Merkle hash).
@@ -38,7 +62,49 @@ struct CASClient: Sendable {
         accessToken: String,
         byteRange: Range<UInt64>?
     ) async throws -> ReconstructionResponse {
-        let url = casURL.appendingPathComponent("v1").appendingPathComponent("reconstructions")
+        if reconstructionAPIVersion.withLockedValue({ $0 }) == .v2 {
+            do {
+                let response = try await reconstruction(
+                    of: fileID,
+                    casURL: casURL,
+                    accessToken: accessToken,
+                    byteRange: byteRange,
+                    version: .v2,
+                    as: ReconstructionResponseV2.self
+                )
+                return ReconstructionResponse(response)
+            } catch let error as XetDownloaderError
+                where error.code == .reconstructionRequestFailed
+                && (error.statusCode == 404 || error.statusCode == 501)
+            {
+                // Older CAS servers don't serve version 2.
+                // A file that doesn't exist also returns 404,
+                // so keep version 2 unless version 1 succeeds.
+            }
+        }
+
+        let response = try await reconstruction(
+            of: fileID,
+            casURL: casURL,
+            accessToken: accessToken,
+            byteRange: byteRange,
+            version: .v1,
+            as: ReconstructionResponse.self
+        )
+        reconstructionAPIVersion.withLockedValue { $0 = .v1 }
+        return response
+    }
+
+    /// Requests and decodes reconstruction metadata from one API version.
+    private func reconstruction<Response: Decodable>(
+        of fileID: String,
+        casURL: URL,
+        accessToken: String,
+        byteRange: Range<UInt64>?,
+        version: ReconstructionAPIVersion,
+        as type: Response.Type
+    ) async throws -> Response {
+        let url = casURL.appendingPathComponent(version.rawValue).appendingPathComponent("reconstructions")
             .appendingPathComponent(fileID)
 
         var request = URLRequest(url: url)
@@ -62,13 +128,16 @@ struct CASClient: Sendable {
         }
 
         do {
-            return try JSONDecoder().decode(ReconstructionResponse.self, from: data)
+            return try JSONDecoder().decode(Response.self, from: data)
         } catch {
             throw XetDownloaderError.reconstructionDecodingFailed(error)
         }
     }
 
-    /// Response from the CAS reconstruction API.
+    /// Response from the version 1 CAS reconstruction API.
+    ///
+    /// The client converts version 2 responses to this form,
+    /// with one fetch info for each byte range.
     ///
     /// Describes how to reassemble a file from chunks stored across one or more xorbs.
     /// The file is reconstructed by processing terms in order,
@@ -240,6 +309,141 @@ struct CASClient: Sendable {
                 try urlRangeContainer.encode(urlRange.upperBound, forKey: .end)
             }
         }
+    }
+
+    /// Response from the version 2 CAS reconstruction API.
+    ///
+    /// The terms are the same as in version 1.
+    /// Instead of one presigned URL for each byte range,
+    /// version 2 lists presigned URLs that cover one or more byte ranges of a xorb.
+    struct ReconstructionResponseV2: Codable, Sendable {
+        /// Byte offset to skip in the first term's output.
+        let offsetIntoFirstRange: UInt64
+
+        /// Ordered list of terms describing chunks to fetch.
+        let terms: [ReconstructionResponse.Term]
+
+        /// Fetches keyed by xorb hash.
+        ///
+        /// A xorb usually has one fetch.
+        /// The server uses more than one when the URL would be too long.
+        let xorbs: [String: [XorbFetch]]
+
+        /// Creates a reconstruction response.
+        init(offsetIntoFirstRange: UInt64, terms: [ReconstructionResponse.Term], xorbs: [String: [XorbFetch]]) {
+            self.offsetIntoFirstRange = offsetIntoFirstRange
+            self.terms = terms
+            self.xorbs = xorbs
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case offsetIntoFirstRange = "offset_into_first_range"
+            case terms
+            case xorbs
+        }
+
+        private enum RangeCodingKeys: String, CodingKey {
+            case start
+            case end
+        }
+
+        /// A presigned URL and the byte ranges of a xorb that it can fetch.
+        struct XorbFetch: Codable, Sendable {
+            /// Presigned URL for downloading xorb data.
+            ///
+            /// The URL's signature covers every range in ``ranges``.
+            /// A request can ask for any one of them in its `Range` header.
+            let url: String
+
+            /// The byte ranges that the URL covers, in ascending order.
+            let ranges: [RangeDescriptor]
+
+            /// Creates a xorb fetch.
+            init(url: String, ranges: [RangeDescriptor]) {
+                self.url = url
+                self.ranges = ranges
+            }
+        }
+
+        /// A range of chunks within a xorb and the bytes that hold them.
+        struct RangeDescriptor: Codable, Sendable {
+            /// Half-open range of chunk indices: `[start, end)`.
+            let chunks: Range<Int>
+
+            /// Closed byte range to request via HTTP `Range` header.
+            let bytes: ClosedRange<UInt64>
+
+            /// Creates a range descriptor.
+            init(chunks: Range<Int>, bytes: ClosedRange<UInt64>) {
+                self.chunks = chunks
+                self.bytes = bytes
+            }
+
+            private enum CodingKeys: String, CodingKey {
+                case chunks
+                case bytes
+            }
+
+            public init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+
+                let chunksContainer = try container.nestedContainer(
+                    keyedBy: RangeCodingKeys.self,
+                    forKey: .chunks
+                )
+                let chunksStart = try chunksContainer.decode(Int.self, forKey: .start)
+                let chunksEnd = try chunksContainer.decode(Int.self, forKey: .end)
+                chunks = chunksStart ..< chunksEnd
+
+                let bytesContainer = try container.nestedContainer(
+                    keyedBy: RangeCodingKeys.self,
+                    forKey: .bytes
+                )
+                let bytesStart = try bytesContainer.decode(UInt64.self, forKey: .start)
+                let bytesEnd = try bytesContainer.decode(UInt64.self, forKey: .end)
+                bytes = bytesStart ... bytesEnd
+            }
+
+            public func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+
+                var chunksContainer = container.nestedContainer(
+                    keyedBy: RangeCodingKeys.self,
+                    forKey: .chunks
+                )
+                try chunksContainer.encode(chunks.lowerBound, forKey: .start)
+                try chunksContainer.encode(chunks.upperBound, forKey: .end)
+
+                var bytesContainer = container.nestedContainer(
+                    keyedBy: RangeCodingKeys.self,
+                    forKey: .bytes
+                )
+                try bytesContainer.encode(bytes.lowerBound, forKey: .start)
+                try bytesContainer.encode(bytes.upperBound, forKey: .end)
+            }
+        }
+    }
+}
+
+extension CASClient.ReconstructionResponse {
+    /// Creates a response from a version 2 response,
+    /// with one fetch info for each byte range.
+    ///
+    /// This matches xet-core's default,
+    /// which fetches the ranges of a URL with separate single-range requests
+    /// instead of one multi-range request.
+    init(_ response: CASClient.ReconstructionResponseV2) {
+        self.init(
+            offsetIntoFirstRange: response.offsetIntoFirstRange,
+            terms: response.terms,
+            fetchInfo: response.xorbs.mapValues { fetches in
+                fetches.flatMap { fetch in
+                    fetch.ranges.map { range in
+                        FetchInfo(url: fetch.url, range: range.chunks, urlRange: range.bytes)
+                    }
+                }
+            }
+        )
     }
 }
 
