@@ -13,6 +13,9 @@ import NIOConcurrencyHelpers
 struct CASClient: Sendable {
     private let urlSession: URLSession
 
+    /// When to retry failed reconstruction requests.
+    private let retryPolicy: RetryPolicy
+
     /// The reconstruction API version to request first.
     ///
     /// The client asks for version 2 until a server answers only version 1,
@@ -28,9 +31,10 @@ struct CASClient: Sendable {
         case v2
     }
 
-    /// Creates a CAS client with the specified URL session.
-    init(urlSession: URLSession = .shared) {
+    /// Creates a CAS client with the specified URL session and retry policy.
+    init(urlSession: URLSession = .shared, retryPolicy: RetryPolicy = RetryPolicy()) {
         self.urlSession = urlSession
+        self.retryPolicy = retryPolicy
     }
 
     /// Fetches reconstruction metadata for a file.
@@ -114,17 +118,20 @@ struct CASClient: Sendable {
             request.setValue(byteRange.httpRangeHeaderValue, forHTTPHeaderField: "Range")
         }
 
-        let (data, response) = try await withTransportErrors(url: url) {
-            try await urlSession.data(for: request)
-        }
-        guard let http = response as? HTTPURLResponse else {
-            throw XetDownloaderError.invalidReconstructionResponse
-        }
-        guard (200 ..< 300).contains(http.statusCode) else {
-            throw XetDownloaderError.reconstructionRequestFailed(
-                statusCode: http.statusCode,
-                body: data
-            )
+        let data = try await withRetries(retryPolicy) {
+            let (data, response) = try await withTransportErrors(url: url) {
+                try await urlSession.data(for: request)
+            }
+            guard let http = response as? HTTPURLResponse else {
+                throw XetDownloaderError.invalidReconstructionResponse
+            }
+            guard (200 ..< 300).contains(http.statusCode) else {
+                throw XetDownloaderError.reconstructionRequestFailed(
+                    statusCode: http.statusCode,
+                    body: data
+                )
+            }
+            return data
         }
 
         do {

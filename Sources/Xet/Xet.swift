@@ -96,6 +96,13 @@ public enum Xet {
 /// to create a downloader with a scoped lifetime.
 /// If you instantiate directly,
 /// call ``shutdown()`` when you are done to release HTTP client resources.
+///
+/// The downloader retries a request that fails with a network error
+/// or with HTTP status 408, 429, or 5xx other than 501,
+/// after a random wait that grows with each retry.
+/// It throws only after the last retry fails.
+/// ``Configuration/maxRetries`` and ``Configuration/retryBaseDelay``
+/// control how many retries it makes and how long it waits.
 public final class XetDownloader: @unchecked Sendable {
     /// Hub token refresh endpoint for CAS credentials.
     private let refreshURL: URL
@@ -178,6 +185,26 @@ public final class XetDownloader: @unchecked Sendable {
         ///   Tokens and file contents may be transmitted in plaintext.
         public var allowsInsecureConnections: Bool = false
 
+        /// Maximum number of times to retry a failed request. Defaults to 5.
+        ///
+        /// The downloader retries a request that fails with a network error
+        /// or with HTTP status 408, 429, or 5xx other than 501.
+        /// Set this to 0 to turn off retries.
+        public var maxRetries: Int = 5
+
+        /// Longest wait before the first retry of a request, in seconds.
+        /// Defaults to 3.
+        ///
+        /// Each wait is random, up to a limit
+        /// that is three times the one before it, to a maximum of 6 minutes.
+        /// With the defaults, the limits are 3, 9, 27, 81, and 243 seconds.
+        public var retryBaseDelay: TimeInterval = 3
+
+        /// The retry policy from ``maxRetries`` and ``retryBaseDelay``.
+        var retryPolicy: RetryPolicy {
+            RetryPolicy(maxRetries: max(0, maxRetries), baseDelay: max(0, retryBaseDelay))
+        }
+
         /// The default configuration.
         public static let `default` = Configuration()
 
@@ -202,9 +229,10 @@ public final class XetDownloader: @unchecked Sendable {
         self.hubToken = hubToken
         self.configuration = configuration
         self.tokenProvider = TokenProvider(
-            urlSession: .shared
+            urlSession: .shared,
+            retryPolicy: configuration.retryPolicy
         )
-        self.casClient = CASClient(urlSession: .shared)
+        self.casClient = CASClient(urlSession: .shared, retryPolicy: configuration.retryPolicy)
         // Multipath TCP goes through Network.framework.
         // NIOTransportServices also builds on Linux, where it has no Network.framework,
         // so check for Network itself; on Linux this would request MPTCP sockets,
@@ -785,8 +813,30 @@ public final class XetDownloader: @unchecked Sendable {
     /// Fetches one xorb range and hands each decoded chunk to `sink`
     /// with its ordinal within the range.
     ///
+    /// A failed attempt that can be retried starts the fetch over.
+    /// Chunks decode in the same order on every attempt,
+    /// so a retry skips the chunks that `sink` already received.
+    ///
     /// The chunk buffer is only valid for the duration of the call.
     private func fetchXorbChunks(
+        request: URLRequest,
+        sink: (_ ordinal: Int, _ chunk: UnsafeRawBufferPointer) throws -> Void
+    ) async throws {
+        var deliveredChunks = 0
+        try await withRetries(configuration.retryPolicy) {
+            try await fetchXorbChunksOnce(request: request) { ordinal, chunk in
+                guard ordinal >= deliveredChunks else {
+                    return
+                }
+                try sink(ordinal, chunk)
+                deliveredChunks += 1
+            }
+        }
+    }
+
+    /// Makes one attempt to fetch a xorb range,
+    /// handing each decoded chunk to `sink` with its ordinal within the range.
+    private func fetchXorbChunksOnce(
         request: URLRequest,
         sink: (_ ordinal: Int, _ chunk: UnsafeRawBufferPointer) throws -> Void
     ) async throws {
@@ -1413,6 +1463,9 @@ extension XetDownloader {
         /// Window before expiration to treat tokens as stale.
         private let safetyWindow: TimeInterval
 
+        /// When to retry failed token requests.
+        private let retryPolicy: RetryPolicy
+
         /// Key for cached connection info.
         private struct CacheKey: Hashable, Sendable {
             let refreshURL: URL
@@ -1443,12 +1496,15 @@ extension XetDownloader {
         ///   - urlSession: The URL session for token requests.
         ///   - safetyWindow: Seconds before expiration to consider a token stale.
         ///     Defaults to 60 seconds.
+        ///   - retryPolicy: When to retry failed token requests.
         init(
             urlSession: URLSession = .shared,
-            safetyWindow: TimeInterval = 60
+            safetyWindow: TimeInterval = 60,
+            retryPolicy: RetryPolicy = RetryPolicy()
         ) {
             self.urlSession = urlSession
             self.safetyWindow = safetyWindow
+            self.retryPolicy = retryPolicy
         }
 
         /// Obtains CAS connection info, using cached tokens when valid.
@@ -1471,7 +1527,7 @@ extension XetDownloader {
                 return try await existing.value
             }
 
-            let task = Task { [urlSession] () throws -> ConnectionInfo in
+            let task = Task { [urlSession, retryPolicy] () throws -> ConnectionInfo in
                 var request = URLRequest(url: refreshURL)
                 request.httpMethod = "GET"
                 request.cachePolicy = .reloadIgnoringLocalCacheData
@@ -1479,17 +1535,20 @@ extension XetDownloader {
                     request.setValue("Bearer \(hubToken)", forHTTPHeaderField: "Authorization")
                 }
 
-                let (data, response) = try await withTransportErrors(url: request.url) {
-                    try await urlSession.data(for: request)
-                }
-                guard let http = response as? HTTPURLResponse else {
-                    throw XetDownloaderError.invalidTokenResponse
-                }
-                guard (200 ..< 300).contains(http.statusCode) else {
-                    throw XetDownloaderError.tokenRequestFailed(
-                        statusCode: http.statusCode,
-                        body: data
-                    )
+                let data = try await withRetries(retryPolicy) {
+                    let (data, response) = try await withTransportErrors(url: request.url) {
+                        try await urlSession.data(for: request)
+                    }
+                    guard let http = response as? HTTPURLResponse else {
+                        throw XetDownloaderError.invalidTokenResponse
+                    }
+                    guard (200 ..< 300).contains(http.statusCode) else {
+                        throw XetDownloaderError.tokenRequestFailed(
+                            statusCode: http.statusCode,
+                            body: data
+                        )
+                    }
+                    return data
                 }
 
                 let decoded: TokenResponse
