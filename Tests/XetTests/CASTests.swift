@@ -277,6 +277,35 @@ struct CASTests {
         #expect(response.offsetIntoFirstRange == UInt64.max)
     }
 
+    @Test(arguments: [
+        #"{"hash": "h", "unpacked_length": 1, "range": {"start": 5, "end": 4}}"#
+    ])
+    func reversedTermRangeThrows(json: String) {
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(ReconstructionResponse.Term.self, from: Data(json.utf8))
+        }
+    }
+
+    @Test(arguments: [
+        #"{"url": "u", "range": {"start": 5, "end": 4}, "url_range": {"start": 0, "end": 9}}"#,
+        #"{"url": "u", "range": {"start": 0, "end": 4}, "url_range": {"start": 9, "end": 0}}"#,
+    ])
+    func reversedFetchInfoRangeThrows(json: String) {
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(ReconstructionResponse.FetchInfo.self, from: Data(json.utf8))
+        }
+    }
+
+    @Test(arguments: [
+        #"{"chunks": {"start": 5, "end": 4}, "bytes": {"start": 0, "end": 9}}"#,
+        #"{"chunks": {"start": 0, "end": 4}, "bytes": {"start": 9, "end": 0}}"#,
+    ])
+    func reversedV2RangeThrows(json: String) {
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(CASClient.ReconstructionResponseV2.RangeDescriptor.self, from: Data(json.utf8))
+        }
+    }
+
     @Test func rangeWithZeroLength() throws {
         let term = ReconstructionResponse.Term(
             hash: "empty",

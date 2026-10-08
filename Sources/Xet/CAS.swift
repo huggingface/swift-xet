@@ -220,6 +220,13 @@ struct CASClient: Sendable {
                 )
                 let start = try rangeContainer.decode(Int.self, forKey: .start)
                 let end = try rangeContainer.decode(Int.self, forKey: .end)
+                guard start <= end else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .end,
+                        in: rangeContainer,
+                        debugDescription: "Range end \(end) is before its start \(start)."
+                    )
+                }
                 range = start ..< end
             }
 
@@ -279,6 +286,13 @@ struct CASClient: Sendable {
                 )
                 let rangeStart = try rangeContainer.decode(Int.self, forKey: .start)
                 let rangeEnd = try rangeContainer.decode(Int.self, forKey: .end)
+                guard rangeStart <= rangeEnd else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .end,
+                        in: rangeContainer,
+                        debugDescription: "Range end \(rangeEnd) is before its start \(rangeStart)."
+                    )
+                }
                 range = rangeStart ..< rangeEnd
 
                 let urlRangeContainer = try container.nestedContainer(
@@ -287,6 +301,13 @@ struct CASClient: Sendable {
                 )
                 let urlStart = try urlRangeContainer.decode(UInt64.self, forKey: .start)
                 let urlEnd = try urlRangeContainer.decode(UInt64.self, forKey: .end)
+                guard urlStart <= urlEnd else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .end,
+                        in: urlRangeContainer,
+                        debugDescription: "Range end \(urlEnd) is before its start \(urlStart)."
+                    )
+                }
                 urlRange = urlStart ... urlEnd
             }
 
@@ -393,6 +414,13 @@ struct CASClient: Sendable {
                 )
                 let chunksStart = try chunksContainer.decode(Int.self, forKey: .start)
                 let chunksEnd = try chunksContainer.decode(Int.self, forKey: .end)
+                guard chunksStart <= chunksEnd else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .end,
+                        in: chunksContainer,
+                        debugDescription: "Range end \(chunksEnd) is before its start \(chunksStart)."
+                    )
+                }
                 chunks = chunksStart ..< chunksEnd
 
                 let bytesContainer = try container.nestedContainer(
@@ -401,6 +429,13 @@ struct CASClient: Sendable {
                 )
                 let bytesStart = try bytesContainer.decode(UInt64.self, forKey: .start)
                 let bytesEnd = try bytesContainer.decode(UInt64.self, forKey: .end)
+                guard bytesStart <= bytesEnd else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .end,
+                        in: bytesContainer,
+                        debugDescription: "Range end \(bytesEnd) is before its start \(bytesStart)."
+                    )
+                }
                 bytes = bytesStart ... bytesEnd
             }
 
