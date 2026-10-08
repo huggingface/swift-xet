@@ -1487,8 +1487,27 @@ extension XetDownloader {
         /// Cached connection info by refresh URL and Hub token.
         private var cache: [CacheKey: ConnectionInfo] = [:]
 
-        /// Inflight token refresh tasks by cache key.
-        private var inflight: [CacheKey: Task<ConnectionInfo, Error>] = [:]
+        /// Inflight token refreshes by cache key.
+        private var inflight: [CacheKey: Refresh] = [:]
+
+        /// The number of token refreshes started so far.
+        ///
+        /// Each refresh gets the next number,
+        /// so a canceled refresh that finishes late can't
+        /// finish a newer refresh for the same key.
+        private var refreshCount = 0
+
+        /// A token request and the callers waiting for its result.
+        private struct Refresh {
+            /// The refresh's number from ``refreshCount``.
+            let number: Int
+
+            /// The task that requests the token.
+            let task: Task<Void, Never>
+
+            /// The waiting callers.
+            var waiters: [UUID: CheckedContinuation<ConnectionInfo, Error>] = [:]
+        }
 
         /// Creates a token provider.
         ///
@@ -1509,6 +1528,11 @@ extension XetDownloader {
 
         /// Obtains CAS connection info, using cached tokens when valid.
         ///
+        /// Concurrent calls for the same refresh URL and Hub token
+        /// share one token request.
+        /// A canceled caller stops waiting right away;
+        /// the request is canceled when no callers are waiting for it.
+        ///
         /// - Parameters:
         ///   - refreshURL: The Hugging Face Hub token endpoint.
         ///   - hubToken: Optional Hub authentication token.
@@ -1516,69 +1540,145 @@ extension XetDownloader {
         /// - Returns: Connection info with CAS URL and access token.
         func connectionInfo(for refreshURL: URL, hubToken: String?) async throws -> ConnectionInfo {
             let key = CacheKey(refreshURL: refreshURL, hubToken: hubToken)
-
-            if let cached = cache[key],
-                cached.expiresAt > Date().addingTimeInterval(safetyWindow)
-            {
+            if let cached = validCachedInfo(for: key) {
                 return cached
             }
 
-            if let existing = inflight[key] {
-                return try await existing.value
+            let waiterID = UUID()
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    addWaiter(continuation, id: waiterID, key: key)
+                }
+            } onCancel: {
+                Task { await self.cancelWaiter(waiterID, key: key) }
+            }
+        }
+
+        /// Returns the cached connection info for a key
+        /// if it doesn't expire within the safety window.
+        private func validCachedInfo(for key: CacheKey) -> ConnectionInfo? {
+            guard let cached = cache[key],
+                cached.expiresAt > Date().addingTimeInterval(safetyWindow)
+            else {
+                return nil
+            }
+            return cached
+        }
+
+        /// Adds a waiting caller, and starts a token request if none is running.
+        private func addWaiter(
+            _ continuation: CheckedContinuation<ConnectionInfo, Error>,
+            id: UUID,
+            key: CacheKey
+        ) {
+            if Task.isCancelled {
+                continuation.resume(throwing: CancellationError())
+                return
+            }
+            if let cached = validCachedInfo(for: key) {
+                continuation.resume(returning: cached)
+                return
+            }
+            if inflight[key] == nil {
+                refreshCount += 1
+                let number = refreshCount
+                let task = Task { [urlSession, retryPolicy] in
+                    let result: Result<ConnectionInfo, Error>
+                    do {
+                        result = .success(
+                            try await Self.requestConnectionInfo(
+                                key: key,
+                                urlSession: urlSession,
+                                retryPolicy: retryPolicy
+                            )
+                        )
+                    } catch {
+                        result = .failure(error)
+                    }
+                    self.finishRefresh(number, key: key, result: result)
+                }
+                inflight[key] = Refresh(number: number, task: task)
+            }
+            inflight[key]?.waiters[id] = continuation
+        }
+
+        /// Stops a caller's wait with `CancellationError`,
+        /// and cancels the token request if no callers are left.
+        private func cancelWaiter(_ id: UUID, key: CacheKey) {
+            guard var refresh = inflight[key],
+                let continuation = refresh.waiters.removeValue(forKey: id)
+            else {
+                return
+            }
+            continuation.resume(throwing: CancellationError())
+            if refresh.waiters.isEmpty {
+                refresh.task.cancel()
+                inflight[key] = nil
+            } else {
+                inflight[key] = refresh
+            }
+        }
+
+        /// Caches a successful result and resumes every waiting caller.
+        private func finishRefresh(_ number: Int, key: CacheKey, result: Result<ConnectionInfo, Error>) {
+            guard let refresh = inflight[key], refresh.number == number else {
+                return
+            }
+            inflight[key] = nil
+            if case .success(let info) = result {
+                cache[key] = info
+            }
+            for continuation in refresh.waiters.values {
+                continuation.resume(with: result)
+            }
+        }
+
+        /// Requests CAS connection info from the Hub token endpoint,
+        /// retrying failures that the policy allows.
+        private static func requestConnectionInfo(
+            key: CacheKey,
+            urlSession: URLSession,
+            retryPolicy: RetryPolicy
+        ) async throws -> ConnectionInfo {
+            var request = URLRequest(url: key.refreshURL)
+            request.httpMethod = "GET"
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            if let hubToken = key.hubToken {
+                request.setValue("Bearer \(hubToken)", forHTTPHeaderField: "Authorization")
             }
 
-            let task = Task { [urlSession, retryPolicy] () throws -> ConnectionInfo in
-                var request = URLRequest(url: refreshURL)
-                request.httpMethod = "GET"
-                request.cachePolicy = .reloadIgnoringLocalCacheData
-                if let hubToken {
-                    request.setValue("Bearer \(hubToken)", forHTTPHeaderField: "Authorization")
+            let data = try await withRetries(retryPolicy) {
+                let (data, response) = try await withTransportErrors(url: request.url) {
+                    try await urlSession.data(for: request)
                 }
-
-                let data = try await withRetries(retryPolicy) {
-                    let (data, response) = try await withTransportErrors(url: request.url) {
-                        try await urlSession.data(for: request)
-                    }
-                    guard let http = response as? HTTPURLResponse else {
-                        throw XetDownloaderError.invalidTokenResponse
-                    }
-                    guard (200 ..< 300).contains(http.statusCode) else {
-                        throw XetDownloaderError.tokenRequestFailed(
-                            statusCode: http.statusCode,
-                            body: data
-                        )
-                    }
-                    return data
-                }
-
-                let decoded: TokenResponse
-                do {
-                    decoded = try JSONDecoder().decode(TokenResponse.self, from: data)
-                } catch {
+                guard let http = response as? HTTPURLResponse else {
                     throw XetDownloaderError.invalidTokenResponse
                 }
-                guard let casURL = URL(string: decoded.casUrl) else {
-                    throw XetDownloaderError.invalidCASURL(decoded.casUrl)
+                guard (200 ..< 300).contains(http.statusCode) else {
+                    throw XetDownloaderError.tokenRequestFailed(
+                        statusCode: http.statusCode,
+                        body: data
+                    )
                 }
-
-                let expiresAt = Date(timeIntervalSince1970: TimeInterval(decoded.exp))
-                return ConnectionInfo(
-                    casURL: casURL,
-                    accessToken: decoded.accessToken,
-                    expiresAt: expiresAt
-                )
+                return data
             }
 
-            inflight[key] = task
+            let decoded: TokenResponse
             do {
-                let value = try await task.value
-                inflight[key] = nil
-                cache[key] = value
-                return value
+                decoded = try JSONDecoder().decode(TokenResponse.self, from: data)
             } catch {
-                inflight[key] = nil
-                throw error
+                throw XetDownloaderError.invalidTokenResponse
             }
+            guard let casURL = URL(string: decoded.casUrl) else {
+                throw XetDownloaderError.invalidCASURL(decoded.casUrl)
+            }
+
+            let expiresAt = Date(timeIntervalSince1970: TimeInterval(decoded.exp))
+            return ConnectionInfo(
+                casURL: casURL,
+                accessToken: decoded.accessToken,
+                expiresAt: expiresAt
+            )
         }
     }
 
