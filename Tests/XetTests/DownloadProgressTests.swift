@@ -605,17 +605,17 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
                 {"accessToken":"fixture","exp":4102444800,"casUrl":"\(casBase)"}
                 """.utf8
             )
-        } else if request.uri.hasPrefix("/v1/reconstructions/") {
+        } else if request.uri.hasPrefix("/v2/reconstructions/") {
             let chunkRange = 0 ..< (streamedXorb?.chunks.count ?? 1)
-            let urlRange: ClosedRange<UInt64> = 0 ... UInt64((streamedXorb?.encodedByteCount ?? 12) - 1)
+            let byteRange: ClosedRange<UInt64> = 0 ... UInt64((streamedXorb?.encodedByteCount ?? 12) - 1)
             let terms = self.terms
             let xorbBase = unreachable == .xorbs ? closedPortBase : base
-            let reconstruction = CASClient.ReconstructionResponse(
+            let reconstruction = CASClient.ReconstructionResponseV2(
                 offsetIntoFirstRange: offset,
                 terms: terms,
-                fetchInfo: Dictionary(
+                xorbs: Dictionary(
                     uniqueKeysWithValues: Set(terms.map(\.hash)).map {
-                        ($0, [.init(url: "\(xorbBase)/\($0)", range: chunkRange, urlRange: urlRange)])
+                        ($0, [.init(url: "\(xorbBase)/\($0)", ranges: [.init(chunks: chunkRange, bytes: byteRange)])])
                     }
                 )
             )
