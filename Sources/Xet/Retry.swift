@@ -56,7 +56,15 @@ extension XetDownloaderError {
     /// Following the Xet protocol and xet-core,
     /// these errors are retryable:
     /// HTTP 408, 429, and 5xx responses other than 501,
-    /// and network failures other than invalid URLs and certificate errors.
+    /// and network failures.
+    ///
+    /// Token and reconstruction requests use `URLSession`,
+    /// so their failures are `URLError` values,
+    /// and the ones in `permanentURLErrorCodes`,
+    /// such as invalid URLs and certificate errors, aren't retried.
+    /// Xorb fetches use AsyncHTTPClient,
+    /// whose failures, including TLS and certificate errors, are all retried.
+    /// xet-core also retries TLS failures, as connection errors.
     var isRetryable: Bool {
         switch code {
         case .transportFailed:
@@ -75,7 +83,7 @@ extension XetDownloaderError {
         }
     }
 
-    /// Network failures that fail the same way on every attempt.
+    /// `URLSession` failures that fail the same way on every attempt.
     private static let permanentURLErrorCodes: Set<URLError.Code> = [
         .badURL,
         .unsupportedURL,
