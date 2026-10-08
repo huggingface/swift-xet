@@ -68,6 +68,8 @@ struct ReconstructionVersionTests {
             }
             #expect(error?.code == .reconstructionRequestFailed)
             #expect(error?.statusCode == 500)
+            // The first attempt and the fixture's 2 retries.
+            #expect(requests.count(for: "/v2/reconstructions/\(Self.fileID)") == 3)
             #expect(requests.count(for: "/v1/reconstructions/\(Self.fileID)") == 0)
         }
     }
@@ -234,6 +236,8 @@ private func withVersionFixture(
     configuration.allowsInsecureConnections = true
     configuration.poolSize = 1
     configuration.prewarmedConnections = 0
+    configuration.maxRetries = 2
+    configuration.retryBaseDelay = 0.01
     let url = URL(string: "http://127.0.0.1:\(channel.localAddress!.port!)/token")!
     do {
         try await Xet.withDownloader(refreshURL: url, configuration: configuration) { downloader in

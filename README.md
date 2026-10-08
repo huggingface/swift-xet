@@ -167,6 +167,23 @@ try await Xet.withDownloader(
 }
 ```
 
+### Retries
+
+The downloader retries a request that fails with a network error
+or with HTTP status 408, 429, or 5xx other than 501.
+By default, it makes up to 5 retries,
+each after a random wait of up to 3, 9, 27, 81, and 243 seconds.
+If a xorb download fails partway through,
+the retry skips the chunks it already received.
+
+Use `maxRetries` and `retryBaseDelay` to change this behavior:
+
+```swift
+var configuration = XetDownloader.Configuration.default
+configuration.maxRetries = 2
+configuration.retryBaseDelay = 1
+```
+
 
 ## How It Works
 

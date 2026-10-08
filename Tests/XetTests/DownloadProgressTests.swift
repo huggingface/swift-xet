@@ -132,13 +132,57 @@ struct DownloadProgressTests {
     }
 
     @Test func failedFetchReportsStatusCodeAndURL() async throws {
-        try await withFixture(failFirstB: true) { downloader, _ in
+        try await withFixture(failingBAttempts: .max, bFailureStatus: .forbidden) { downloader, requests in
+            let error = await downloaderError {
+                _ = try await downloader.data(for: Self.fileID)
+            }
+            #expect(error?.code == .fetchFailed)
+            #expect(error?.statusCode == 403)
+            #expect(error?.url?.path == "/b")
+            // 403 isn't retryable.
+            #expect(requests.count(for: "/b") == 1)
+        }
+    }
+
+    @Test(arguments: [false, true])
+    func retryableFetchFailureIsRetried(writeToDisk: Bool) async throws {
+        try await withFixture(failingBAttempts: 1) { downloader, requests in
+            let progress = ProgressRecorder()
+            let data: Data
+            if writeToDisk {
+                let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: destination) }
+                try await downloader.download(Self.fileID, to: destination, progress: progress.record)
+                data = try Data(contentsOf: destination)
+            } else {
+                data = try await downloader.data(for: Self.fileID, progress: progress.record)
+            }
+
+            #expect(data == Data("aaaaBBBBaaaa".utf8))
+            #expect(requests.count(for: "/b") == 2)
+            #expect(progress.values.last == .init(completed: 12, total: 12))
+            #expect(progress.values.filter { $0.completed == $0.total }.count == 1)
+        }
+    }
+
+    @Test func exhaustedRetriesReportLastFailure() async throws {
+        try await withFixture(failingBAttempts: .max) { downloader, requests in
             let error = await downloaderError {
                 _ = try await downloader.data(for: Self.fileID)
             }
             #expect(error?.code == .fetchFailed)
             #expect(error?.statusCode == 500)
-            #expect(error?.url?.path == "/b")
+            // The first attempt and the fixture's 2 retries.
+            #expect(requests.count(for: "/b") == 3)
+        }
+    }
+
+    @Test func tokenAndReconstructionFailuresAreRetried() async throws {
+        try await withFixture(failingTokenAttempts: 1, failingReconstructionAttempts: 2) { downloader, requests in
+            let data = try await downloader.data(for: Self.fileID)
+            #expect(data == Data("aaaaBBBBaaaa".utf8))
+            #expect(requests.count(for: "/token") == 2)
+            #expect(requests.count(for: "/v2/reconstructions/\(Self.fileID)") == 3)
         }
     }
 
@@ -202,13 +246,14 @@ struct DownloadProgressTests {
     }
 
     @Test func droppedXorbConnectionThrowsTransportFailed() async throws {
-        try await withFixture(dropsXorbConnection: true) { downloader, _ in
+        try await withFixture(dropsXorbConnection: true) { downloader, requests in
             let error = await downloaderError {
                 _ = try await downloader.data(for: Self.fileID)
             }
             #expect(error?.code == .transportFailed)
             #expect(error?.url?.path == "/a")
             #expect(error?.underlyingError != nil)
+            #expect(requests.count(for: "/a") == 3)
         }
     }
 
@@ -245,7 +290,7 @@ struct DownloadProgressTests {
     }
 
     @Test func failureAndRetryHaveIndependentCounts() async throws {
-        try await withFixture(failFirstB: true) { downloader, _ in
+        try await withFixture(failingBAttempts: 1, bFailureStatus: .forbidden) { downloader, _ in
             let failedProgress = ProgressRecorder()
             await #expect(throws: XetDownloaderError.self) {
                 _ = try await downloader.data(for: Self.fileID, progress: failedProgress.record)
@@ -386,7 +431,7 @@ struct DownloadProgressTests {
     }
 
     @Test func diskFailureDoesNotComplete() async throws {
-        try await withFixture(failFirstB: true) { downloader, _ in
+        try await withFixture(failingBAttempts: 1, bFailureStatus: .forbidden) { downloader, _ in
             let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: destination) }
             let progress = ProgressRecorder()
@@ -399,6 +444,36 @@ struct DownloadProgressTests {
             #expect(data.prefix(4) == Data("aaaa".utf8))
             #expect(data.count <= 12)
             #expect(!data.contains(UInt8(ascii: "B")))
+        }
+    }
+
+    @Test(arguments: [false, true])
+    func retryAfterDroppedStreamSkipsDeliveredChunks(writeToDisk: Bool) async throws {
+        let xorb = StreamedXorbFixture()
+        try await withFixture(
+            hashes: ["a"],
+            unpackedLength: UInt32(xorb.output.count),
+            streamedXorb: xorb,
+            dropsStreamedXorbAfterChunks: 40
+        ) { downloader, requests in
+            let progress = ProgressRecorder()
+            let data: Data
+            if writeToDisk {
+                let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: destination) }
+                try await downloader.download(Self.fileID, to: destination, progress: progress.record)
+                data = try Data(contentsOf: destination)
+            } else {
+                data = try await downloader.data(for: Self.fileID, progress: progress.record)
+            }
+
+            #expect(data == xorb.output)
+            #expect(requests.count(for: "/a") == 2)
+            let total = Int64(xorb.output.count)
+            #expect(progress.values.allSatisfy { $0.total == total && $0.completed <= total })
+            #expect(progress.values.map(\.completed) == progress.values.map(\.completed).sorted())
+            #expect(progress.values.last == .init(completed: total, total: total))
+            #expect(progress.values.filter { $0.completed == $0.total }.count == 1)
         }
     }
 
@@ -539,12 +614,16 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
     private let hashes: [String]
     private let offset: UInt64
     private let unpackedLength: UInt32
-    private let failFirstB: Bool
+    private let failingTokenAttempts: Int
+    private let failingReconstructionAttempts: Int
+    private let failingBAttempts: Int
+    private let bFailureStatus: HTTPResponseStatus
     private let corruption: XorbCorruption?
     private let unreachable: UnreachableHost?
     private let dropsXorbConnection: Bool
     private let delayB: TimeAmount
     private let streamedXorb: StreamedXorbFixture?
+    private let dropsStreamedXorbAfterChunks: Int?
     private let termRanges: [Range<Int>]?
     private let requests: RequestRecorder
 
@@ -552,24 +631,32 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         hashes: [String],
         offset: UInt64,
         unpackedLength: UInt32,
-        failFirstB: Bool,
+        failingTokenAttempts: Int,
+        failingReconstructionAttempts: Int,
+        failingBAttempts: Int,
+        bFailureStatus: HTTPResponseStatus,
         corruption: XorbCorruption?,
         unreachable: UnreachableHost?,
         dropsXorbConnection: Bool,
         delayB: TimeAmount,
         streamedXorb: StreamedXorbFixture?,
+        dropsStreamedXorbAfterChunks: Int?,
         termRanges: [Range<Int>]?,
         requests: RequestRecorder
     ) {
         self.hashes = hashes
         self.offset = offset
         self.unpackedLength = unpackedLength
-        self.failFirstB = failFirstB
+        self.failingTokenAttempts = failingTokenAttempts
+        self.failingReconstructionAttempts = failingReconstructionAttempts
+        self.failingBAttempts = failingBAttempts
+        self.bFailureStatus = bFailureStatus
         self.corruption = corruption
         self.unreachable = unreachable
         self.dropsXorbConnection = dropsXorbConnection
         self.delayB = delayB
         self.streamedXorb = streamedXorb
+        self.dropsStreamedXorbAfterChunks = dropsStreamedXorbAfterChunks
         self.termRanges = termRanges
         self.requests = requests
     }
@@ -592,13 +679,19 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         let attempt = requests.record(request.uri)
         if request.uri == "/a", let streamedXorb {
             #expect(request.headers.first(name: "Range") == "bytes=0-\(streamedXorb.encodedByteCount - 1)")
-            send(streamedXorb, context: context)
+            send(streamedXorb, context: context, dropAfter: attempt == 1 ? dropsStreamedXorbAfterChunks : nil)
             return
         }
         let base = "http://127.0.0.1:\(context.channel.localAddress!.port!)"
         var status = HTTPResponseStatus.ok
         let body: Data
-        if request.uri == "/token" {
+        if request.uri == "/token", attempt <= failingTokenAttempts {
+            status = .tooManyRequests
+            body = Data()
+        } else if request.uri.hasPrefix("/v2/reconstructions/"), attempt <= failingReconstructionAttempts {
+            status = .serviceUnavailable
+            body = Data()
+        } else if request.uri == "/token" {
             let casBase = unreachable == .cas ? closedPortBase : base
             body = Data(
                 """
@@ -620,8 +713,8 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
                 )
             )
             body = try! JSONEncoder().encode(reconstruction)
-        } else if request.uri == "/b", failFirstB, attempt == 1 {
-            status = .internalServerError
+        } else if request.uri == "/b", attempt <= failingBAttempts {
+            status = bFailureStatus
             body = Data()
         } else if request.uri == "/a" || request.uri == "/b" {
             switch corruption {
@@ -667,7 +760,10 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         }
     }
 
-    private func send(_ xorb: StreamedXorbFixture, context: ChannelHandlerContext) {
+    /// Streams the xorb one chunk at a time.
+    ///
+    /// If `dropAfter` is set, closes the connection after sending that many chunks.
+    private func send(_ xorb: StreamedXorbFixture, context: ChannelHandlerContext, dropAfter: Int? = nil) {
         let head = HTTPResponseHead(
             version: .http1_1,
             status: .partialContent,
@@ -684,6 +780,10 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
             context.eventLoop.scheduleTask(in: .milliseconds(Int64(index) * 5)) {
                 let context = boundContext.value
                 guard context.channel.isActive else { return }
+                if index == dropAfter {
+                    context.close(promise: nil)
+                    return
+                }
                 requests.recordChunk()
                 context.writeAndFlush(
                     NIOAny(HTTPServerResponsePart.body(.byteBuffer(ByteBuffer(bytes: chunk)))),
@@ -701,12 +801,16 @@ private func withFixture(
     hashes: [String] = ["a", "b", "a"],
     offset: UInt64 = 0,
     unpackedLength: UInt32 = 4,
-    failFirstB: Bool = false,
+    failingTokenAttempts: Int = 0,
+    failingReconstructionAttempts: Int = 0,
+    failingBAttempts: Int = 0,
+    bFailureStatus: HTTPResponseStatus = .internalServerError,
     corruption: XorbCorruption? = nil,
     unreachable: UnreachableHost? = nil,
     dropsXorbConnection: Bool = false,
     delayB: TimeAmount = .nanoseconds(0),
     streamedXorb: StreamedXorbFixture? = nil,
+    dropsStreamedXorbAfterChunks: Int? = nil,
     termRanges: [Range<Int>]? = nil,
     maxConcurrentFetches: Int = 1,
     _ body: (XetDownloader, RequestRecorder) async throws -> Void
@@ -721,12 +825,16 @@ private func withFixture(
                         hashes: hashes,
                         offset: offset,
                         unpackedLength: unpackedLength,
-                        failFirstB: failFirstB,
+                        failingTokenAttempts: failingTokenAttempts,
+                        failingReconstructionAttempts: failingReconstructionAttempts,
+                        failingBAttempts: failingBAttempts,
+                        bFailureStatus: bFailureStatus,
                         corruption: corruption,
                         unreachable: unreachable,
                         dropsXorbConnection: dropsXorbConnection,
                         delayB: delayB,
                         streamedXorb: streamedXorb,
+                        dropsStreamedXorbAfterChunks: dropsStreamedXorbAfterChunks,
                         termRanges: termRanges,
                         requests: requests
                     )
@@ -745,6 +853,8 @@ private func withFixture(
         configuration.connectTimeout = 1
     }
     configuration.scalesFetchConcurrencyAutomatically = false
+    configuration.maxRetries = 2
+    configuration.retryBaseDelay = 0.01
     let url = URL(string: "http://127.0.0.1:\(channel.localAddress!.port!)/token")!
     do {
         try await Xet.withDownloader(refreshURL: url, configuration: configuration) { downloader in
