@@ -175,6 +175,8 @@ By default, it makes up to 5 retries,
 each after a random wait of up to 3, 9, 27, 81, and 243 seconds.
 If a xorb download fails partway through,
 the retry skips the chunks it already received.
+A xorb download refused with HTTP 403 is made again
+with a fresh presigned URL from a new reconstruction.
 
 Use `maxRetries` and `retryBaseDelay` to change this behavior:
 
