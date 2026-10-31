@@ -189,6 +189,8 @@ public final class XetDownloader: @unchecked Sendable {
         ///
         /// The downloader retries a request that fails with a network error
         /// or with HTTP status 408, 429, or 5xx other than 501.
+        /// A xorb fetch that received more chunks since its last failure
+        /// starts the count over.
         /// Set this to 0 to turn off retries.
         public var maxRetries: Int = 5
 
@@ -823,7 +825,7 @@ public final class XetDownloader: @unchecked Sendable {
         sink: (_ ordinal: Int, _ chunk: UnsafeRawBufferPointer) throws -> Void
     ) async throws {
         var deliveredChunks = 0
-        try await withRetries(configuration.retryPolicy) {
+        try await withRetries(configuration.retryPolicy, progress: { deliveredChunks }) {
             try await fetchXorbChunksOnce(request: request) { ordinal, chunk in
                 guard ordinal >= deliveredChunks else {
                     return
