@@ -526,7 +526,6 @@ public final class XetDownloader: @unchecked Sendable {
 
             var request = URLRequest(url: fetchURL)
             request.httpMethod = "GET"
-            request.setValue(fetchInfo.urlRangeHeaderValue, forHTTPHeaderField: "Range")
             let key = FetchRangeKey(
                 hash: term.hash,
                 start: fetchInfo.range.lowerBound,
@@ -833,7 +832,7 @@ public final class XetDownloader: @unchecked Sendable {
     /// so a retry skips the chunks that `sink` already received.
     /// Presigned URLs expire,
     /// so an attempt refused with HTTP 403 is made again
-    /// with the URL from a new reconstruction, if that URL is different.
+    /// with the URL and signed byte range from a new reconstruction, if that URL is different.
     ///
     /// The chunk buffer is only valid for the duration of the call.
     private func fetchXorbChunks(
@@ -842,8 +841,10 @@ public final class XetDownloader: @unchecked Sendable {
     ) async throws {
         var request = context.request
         var deliveredChunks = 0
-        func attempt(with url: URL) async throws {
-            request.url = url
+        func attempt(with fetch: FetchURLs.Fetch) async throws {
+            request.url = fetch.url
+            // A presigned URL authorizes only the byte range it was signed for.
+            request.setValue(fetch.fetchInfo.urlRangeHeaderValue, forHTTPHeaderField: "Range")
             try await fetchXorbChunksOnce(request: request) { ordinal, chunk in
                 guard ordinal >= deliveredChunks else {
                     return
@@ -855,14 +856,15 @@ public final class XetDownloader: @unchecked Sendable {
         let range = context.fetchInfo.range
         let hash = context.term.hash
         try await withRetries(configuration.retryPolicy) {
-            let url = try await context.fetchURLs.url(forRange: range, of: hash)
+            let fetch = try await context.fetchURLs.fetch(forRange: range, of: hash)
             do {
-                try await attempt(with: url)
+                try await attempt(with: fetch)
             } catch let error as XetDownloaderError where error.statusCode == 403 {
-                guard let freshURL = try await context.fetchURLs.url(forRange: range, of: hash, replacing: url) else {
+                let fresh = try await context.fetchURLs.fetch(forRange: range, of: hash, replacing: fetch.url)
+                guard let fresh else {
                     throw error
                 }
-                try await attempt(with: freshURL)
+                try await attempt(with: fresh)
             }
         }
     }
@@ -1741,6 +1743,12 @@ private struct FetchRangeKey: Hashable {
 /// whose URLs replace those of every fetch.
 /// Fetches refused with the same URLs share it.
 private actor FetchURLs {
+    /// A presigned URL with the fetch info, including the byte range, it was signed for.
+    struct Fetch: Sendable {
+        let url: URL
+        let fetchInfo: CASClient.ReconstructionResponse.FetchInfo
+    }
+
     private var reconstruction: CASClient.ReconstructionResponse
     private var refresh: Task<Void, any Error>?
     private let allowsInsecureConnections: Bool
@@ -1756,8 +1764,8 @@ private actor FetchURLs {
         self.reconstruct = reconstruct
     }
 
-    /// The URL of the fetch of `range` from the xorb `hash`.
-    func url(forRange range: Range<Int>, of hash: String) throws -> URL {
+    /// The fetch of `range` from the xorb `hash`.
+    func fetch(forRange range: Range<Int>, of hash: String) throws -> Fetch {
         guard let fetchInfo = reconstruction.fetchInfo[hash]?.first(where: { $0.range == range }) else {
             throw XetDownloaderError.invalidReconstruction
         }
@@ -1767,16 +1775,17 @@ private actor FetchURLs {
         guard allowsInsecureConnections || url.scheme == "https" else {
             throw XetDownloaderError.insecureURL(url)
         }
-        return url
+        return Fetch(url: url, fetchInfo: fetchInfo)
     }
 
-    /// Returns a URL to use in place of `refused` for the fetch of `range` from the xorb `hash`,
+    /// Returns a fetch to use in place of the one with the URL `refused`
+    /// for `range` from the xorb `hash`,
     /// or `nil` if a new reconstruction has the same URL.
     ///
     /// The fetches of a download share one new reconstruction,
     /// and canceling any of them cancels it.
-    func url(forRange range: Range<Int>, of hash: String, replacing refused: URL) async throws -> URL? {
-        if refresh == nil, try url(forRange: range, of: hash) == refused {
+    func fetch(forRange range: Range<Int>, of hash: String, replacing refused: URL) async throws -> Fetch? {
+        if refresh == nil, try fetch(forRange: range, of: hash).url == refused {
             // The task runs on this actor, so it can't finish before `refresh` is set.
             refresh = Task {
                 defer { refresh = nil }
@@ -1790,8 +1799,8 @@ private actor FetchURLs {
                 refresh.cancel()
             }
         }
-        let url = try url(forRange: range, of: hash)
-        return url == refused ? nil : url
+        let fresh = try fetch(forRange: range, of: hash)
+        return fresh.url == refused ? nil : fresh
     }
 }
 

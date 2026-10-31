@@ -792,7 +792,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
             )
         } else if path.hasPrefix("/v2/reconstructions/") {
             let chunkRange = 0 ..< (streamedXorb?.chunks.count ?? 1)
-            let byteRange: ClosedRange<UInt64> = 0 ... UInt64((streamedXorb?.encodedByteCount ?? 12) - 1)
+            let byteRange = signedByteRange(forReconstruction: attempt)
             let terms = self.terms
             let xorbBase = unreachable == .xorbs ? closedPortBase : base
             let signature = fetchURLSignature(forReconstruction: attempt)
@@ -812,6 +812,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
             body = try! JSONEncoder().encode(reconstruction)
         } else if let reconstruction = signingReconstruction(of: request.uri),
             reconstruction <= refusedFetchURLReconstructions
+                || request.headers.first(name: "Range") != httpRange(signedByReconstruction: reconstruction)
         {
             status = .forbidden
             body = Data()
@@ -869,6 +870,21 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
     /// or nothing if no fetch URLs are refused.
     private func fetchURLSignature(forReconstruction attempt: Int) -> String {
         refusedFetchURLReconstructions > 0 ? "?reconstruction=\(attempt)" : ""
+    }
+
+    /// The byte range a reconstruction signs its fetch URLs for.
+    ///
+    /// A presigned URL is refused for bytes outside its signed range.
+    /// When fetch URLs are refused, each new reconstruction moves the range,
+    /// so a fetch that keeps a stale `Range` header is refused too.
+    private func signedByteRange(forReconstruction attempt: Int) -> ClosedRange<UInt64> {
+        let start = refusedFetchURLReconstructions > 0 ? UInt64(attempt - 1) * 100 : 0
+        return start ... start + UInt64((streamedXorb?.encodedByteCount ?? 12) - 1)
+    }
+
+    private func httpRange(signedByReconstruction attempt: Int) -> String {
+        let range = signedByteRange(forReconstruction: attempt)
+        return "bytes=\(range.lowerBound)-\(range.upperBound)"
     }
 
     /// The reconstruction that signed a fetch URL.
