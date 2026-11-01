@@ -509,6 +509,86 @@ struct DownloadProgressTests {
         }
     }
 
+    @Test(arguments: [false, true])
+    func refusedFetchIsMadeAgainWithAFreshURL(writeToDisk: Bool) async throws {
+        try await withFixture(refusedFetchURLReconstructions: 1) { downloader, requests in
+            let data: Data
+            if writeToDisk {
+                let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: destination) }
+                try await downloader.download(Self.fileID, to: destination)
+                data = try Data(contentsOf: destination)
+            } else {
+                data = try await downloader.data(for: Self.fileID)
+            }
+
+            #expect(data == Data("aaaaBBBBaaaa".utf8))
+            #expect(requests.count(for: "/v2/reconstructions/\(Self.fileID)") == 2)
+            #expect(requests.count(for: "/a") == 2)
+            // The fetch of "b" starts with the fresh URL.
+            #expect(requests.count(for: "/b") == 1)
+        }
+    }
+
+    @Test(arguments: [0, 500])
+    func refusedFetchesShareOneNewReconstruction(delayBMilliseconds: Int64) async throws {
+        // Without a delay, "b" is refused while the new reconstruction is on its way.
+        // With one, "b" is refused after it has arrived.
+        try await withFixture(
+            delayB: .milliseconds(delayBMilliseconds),
+            refusedFetchURLReconstructions: 1,
+            refreshedReconstructionDelay: .milliseconds(100),
+            maxConcurrentFetches: 2
+        ) { downloader, requests in
+            let data = try await downloader.data(for: Self.fileID)
+            #expect(data == Data("aaaaBBBBaaaa".utf8))
+            #expect(requests.count(for: "/v2/reconstructions/\(Self.fileID)") == 2)
+            #expect(requests.count(for: "/a") == 2)
+            #expect(requests.count(for: "/b") == 2)
+        }
+    }
+
+    @Test func failedURLRefreshIsRetriedWithTheFetch() async throws {
+        // The refresh's reconstruction request fails on its first attempt and the fixture's 2 retries,
+        // so the fetch is retried, and its refresh succeeds.
+        try await withFixture(refusedFetchURLReconstructions: 1, failingRefreshAttempts: 3) {
+            downloader,
+            requests in
+            let data = try await downloader.data(for: Self.fileID)
+            #expect(data == Data("aaaaBBBBaaaa".utf8))
+            #expect(requests.count(for: "/v2/reconstructions/\(Self.fileID)") == 5)
+            #expect(requests.count(for: "/a") == 3)
+        }
+    }
+
+    @Test func cancellationDuringURLRefreshIsPrompt() async throws {
+        try await withFixture(refusedFetchURLReconstructions: 1, refreshedReconstructionDelay: .seconds(3)) {
+            downloader,
+            requests in
+            let task = Task { try await downloader.data(for: Self.fileID) }
+            // Wait until the refused fetch has asked for the new reconstruction.
+            while requests.count(for: "/v2/reconstructions/\(Self.fileID)") < 2 {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            let start = ContinuousClock.now
+            task.cancel()
+            await #expect(throws: CancellationError.self) { try await task.value }
+            #expect(ContinuousClock.now - start < .seconds(1))
+        }
+    }
+
+    @Test func refusedFreshURLFailsTheFetch() async throws {
+        try await withFixture(refusedFetchURLReconstructions: 2) { downloader, requests in
+            let error = await downloaderError {
+                _ = try await downloader.data(for: Self.fileID)
+            }
+            #expect(error?.code == .fetchFailed)
+            #expect(error?.statusCode == 403)
+            #expect(requests.count(for: "/v2/reconstructions/\(Self.fileID)") == 2)
+            #expect(requests.count(for: "/a") == 2)
+        }
+    }
+
     @Test func fastCachedTermsLimitCallbackFrequency() async throws {
         try await withFixture(hashes: Array(repeating: "a", count: 500)) { downloader, requests in
             let progress = ProgressRecorder()
@@ -641,6 +721,9 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
     private let streamedXorb: StreamedXorbFixture?
     private let dropsStreamedXorbAfterChunks: [Int]
     private let termRanges: [Range<Int>]?
+    private let refusedFetchURLReconstructions: Int
+    private let failingRefreshAttempts: Int
+    private let refreshedReconstructionDelay: TimeAmount
     private let requests: RequestRecorder
 
     init(
@@ -658,6 +741,9 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         streamedXorb: StreamedXorbFixture?,
         dropsStreamedXorbAfterChunks: [Int],
         termRanges: [Range<Int>]?,
+        refusedFetchURLReconstructions: Int,
+        failingRefreshAttempts: Int,
+        refreshedReconstructionDelay: TimeAmount,
         requests: RequestRecorder
     ) {
         self.hashes = hashes
@@ -674,6 +760,9 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         self.streamedXorb = streamedXorb
         self.dropsStreamedXorbAfterChunks = dropsStreamedXorbAfterChunks
         self.termRanges = termRanges
+        self.refusedFetchURLReconstructions = refusedFetchURLReconstructions
+        self.failingRefreshAttempts = failingRefreshAttempts
+        self.refreshedReconstructionDelay = refreshedReconstructionDelay
         self.requests = requests
     }
 
@@ -692,8 +781,9 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         guard case .head(let request) = unwrapInboundIn(data) else { return }
-        let attempt = requests.record(request.uri)
-        if request.uri == "/a", let streamedXorb {
+        let path = String(request.uri.prefix { $0 != "?" })
+        let attempt = requests.record(path)
+        if path == "/a", let streamedXorb {
             #expect(request.headers.first(name: "Range") == "bytes=0-\(streamedXorb.encodedByteCount - 1)")
             send(streamedXorb, context: context, dropAfter: dropsStreamedXorbAfterChunks.dropFirst(attempt - 1).first)
             return
@@ -701,38 +791,51 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         let base = "http://127.0.0.1:\(context.channel.localAddress!.port!)"
         var status = HTTPResponseStatus.ok
         let body: Data
-        if request.uri == "/token", attempt <= failingTokenAttempts {
+        if path == "/token", attempt <= failingTokenAttempts {
             status = .tooManyRequests
             body = Data()
-        } else if request.uri.hasPrefix("/v2/reconstructions/"), attempt <= failingReconstructionAttempts {
+        } else if path.hasPrefix("/v2/reconstructions/"),
+            attempt <= failingReconstructionAttempts || (2 ..< failingRefreshAttempts + 2).contains(attempt)
+        {
             status = .serviceUnavailable
             body = Data()
-        } else if request.uri == "/token" {
+        } else if path == "/token" {
             let casBase = unreachable == .cas ? closedPortBase : base
             body = Data(
                 """
                 {"accessToken":"fixture","exp":4102444800,"casUrl":"\(casBase)"}
                 """.utf8
             )
-        } else if request.uri.hasPrefix("/v2/reconstructions/") {
+        } else if path.hasPrefix("/v2/reconstructions/") {
             let chunkRange = 0 ..< (streamedXorb?.chunks.count ?? 1)
-            let byteRange: ClosedRange<UInt64> = 0 ... UInt64((streamedXorb?.encodedByteCount ?? 12) - 1)
+            let byteRange = signedByteRange(forReconstruction: attempt)
             let terms = self.terms
             let xorbBase = unreachable == .xorbs ? closedPortBase : base
+            let signature = fetchURLSignature(forReconstruction: attempt)
             let reconstruction = CASClient.ReconstructionResponseV2(
                 offsetIntoFirstRange: offset,
                 terms: terms,
                 xorbs: Dictionary(
                     uniqueKeysWithValues: Set(terms.map(\.hash)).map {
-                        ($0, [.init(url: "\(xorbBase)/\($0)", ranges: [.init(chunks: chunkRange, bytes: byteRange)])])
+                        let fetch = CASClient.ReconstructionResponseV2.XorbFetch(
+                            url: "\(xorbBase)/\($0)\(signature)",
+                            ranges: [.init(chunks: chunkRange, bytes: byteRange)]
+                        )
+                        return ($0, [fetch])
                     }
                 )
             )
             body = try! JSONEncoder().encode(reconstruction)
-        } else if request.uri == "/b", attempt <= failingBAttempts {
+        } else if let reconstruction = signingReconstruction(of: request.uri),
+            reconstruction <= refusedFetchURLReconstructions
+                || request.headers.first(name: "Range") != httpRange(signedByReconstruction: reconstruction)
+        {
+            status = .forbidden
+            body = Data()
+        } else if path == "/b", attempt <= failingBAttempts {
             status = bFailureStatus
             body = Data()
-        } else if request.uri == "/a" || request.uri == "/b" {
+        } else if path == "/a" || path == "/b" {
             switch corruption {
             case .header:
                 // A version byte other than 0 makes the chunk header invalid.
@@ -742,7 +845,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
                 // points before the start of the output.
                 body = Data([0, 4, 0, 0, 1, 4, 0, 0]) + Data([0x10, 0x61, 0x05, 0x00])
             case nil:
-                body = Data([0, 4, 0, 0, 0, 4, 0, 0]) + Data((request.uri == "/a" ? "aaaa" : "BBBB").utf8)
+                body = Data([0, 4, 0, 0, 0, 4, 0, 0]) + Data((path == "/a" ? "aaaa" : "BBBB").utf8)
             }
         } else {
             status = .notFound
@@ -755,9 +858,12 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         )
         let response = NIOLoopBound((context, head, body), eventLoop: context.eventLoop)
         let requests = self.requests
-        let path = request.uri
         let dropsConnection = dropsXorbConnection && (path == "/a" || path == "/b")
-        context.eventLoop.scheduleTask(in: request.uri == "/b" ? delayB : .nanoseconds(0)) {
+        var delay = path == "/b" ? delayB : .nanoseconds(0)
+        if path.hasPrefix("/v2/reconstructions/"), attempt > 1 {
+            delay = refreshedReconstructionDelay
+        }
+        context.eventLoop.scheduleTask(in: delay) {
             let (context, head, body) = response.value
             requests.recordResponse(path)
             if dropsConnection {
@@ -774,6 +880,32 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
             context.write(NIOAny(HTTPServerResponsePart.body(.byteBuffer(ByteBuffer(bytes: body)))), promise: nil)
             context.writeAndFlush(NIOAny(HTTPServerResponsePart.end(nil)), promise: nil)
         }
+    }
+
+    /// The query that signs the fetch URLs of a reconstruction,
+    /// or nothing if no fetch URLs are refused.
+    private func fetchURLSignature(forReconstruction attempt: Int) -> String {
+        refusedFetchURLReconstructions > 0 ? "?reconstruction=\(attempt)" : ""
+    }
+
+    /// The byte range a reconstruction signs its fetch URLs for.
+    ///
+    /// A presigned URL is refused for bytes outside its signed range.
+    /// When fetch URLs are refused, each new reconstruction moves the range,
+    /// so a fetch that keeps a stale `Range` header is refused too.
+    private func signedByteRange(forReconstruction attempt: Int) -> ClosedRange<UInt64> {
+        let start = refusedFetchURLReconstructions > 0 ? UInt64(attempt - 1) * 100 : 0
+        return start ... start + UInt64((streamedXorb?.encodedByteCount ?? 12) - 1)
+    }
+
+    private func httpRange(signedByReconstruction attempt: Int) -> String {
+        let range = signedByteRange(forReconstruction: attempt)
+        return "bytes=\(range.lowerBound)-\(range.upperBound)"
+    }
+
+    /// The reconstruction that signed a fetch URL.
+    private func signingReconstruction(of uri: String) -> Int? {
+        URLComponents(string: uri)?.queryItems?.first { $0.name == "reconstruction" }?.value.flatMap { Int($0) }
     }
 
     /// Streams the xorb one chunk at a time.
@@ -828,6 +960,9 @@ private func withFixture(
     streamedXorb: StreamedXorbFixture? = nil,
     dropsStreamedXorbAfterChunks: [Int] = [],
     termRanges: [Range<Int>]? = nil,
+    refusedFetchURLReconstructions: Int = 0,
+    failingRefreshAttempts: Int = 0,
+    refreshedReconstructionDelay: TimeAmount = .nanoseconds(0),
     maxConcurrentFetches: Int = 1,
     _ body: (XetDownloader, RequestRecorder) async throws -> Void
 ) async throws {
@@ -852,6 +987,9 @@ private func withFixture(
                         streamedXorb: streamedXorb,
                         dropsStreamedXorbAfterChunks: dropsStreamedXorbAfterChunks,
                         termRanges: termRanges,
+                        refusedFetchURLReconstructions: refusedFetchURLReconstructions,
+                        failingRefreshAttempts: failingRefreshAttempts,
+                        refreshedReconstructionDelay: refreshedReconstructionDelay,
                         requests: requests
                     )
                 )

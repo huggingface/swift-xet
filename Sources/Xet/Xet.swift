@@ -101,6 +101,7 @@ public enum Xet {
 /// or with HTTP status 408, 429, or 5xx other than 501,
 /// after a random wait that grows with each retry.
 /// It throws only after the last retry fails.
+/// A xorb fetch refused with HTTP 403 is made again with a fresh presigned URL.
 /// ``Configuration/maxRetries`` and ``Configuration/retryBaseDelay``
 /// control how many retries it makes and how long it waits.
 public final class XetDownloader: @unchecked Sendable {
@@ -475,23 +476,12 @@ public final class XetDownloader: @unchecked Sendable {
             throw XetDownloaderError.invalidFileID(fileID)
         }
 
-        let conn = try await tokenProvider.connectionInfo(
-            for: refreshURL,
-            hubToken: hubToken
-        )
+        let reconstruction = try await reconstruct(fileID, byteRange: byteRange)
         try Task.checkCancellation()
-        // Validate CAS URL uses HTTPS unless insecure connections are allowed
-        if !configuration.allowsInsecureConnections && conn.casURL.scheme != "https" {
-            throw XetDownloaderError.insecureURL(conn.casURL)
+        let fetchURLs = FetchURLs(reconstruction, allowsInsecureConnections: configuration.allowsInsecureConnections) {
+            [self] in
+            try await reconstruct(fileID, byteRange: byteRange)
         }
-
-        let reconstruction = try await casClient.reconstruction(
-            of: fileID,
-            casURL: conn.casURL,
-            accessToken: conn.accessToken,
-            byteRange: byteRange
-        )
-        try Task.checkCancellation()
         let maxBytesToWrite = byteRange.map { $0.upperBound - $0.lowerBound }
 
         var reconstructedBytes: UInt64 = 0
@@ -538,7 +528,6 @@ public final class XetDownloader: @unchecked Sendable {
 
             var request = URLRequest(url: fetchURL)
             request.httpMethod = "GET"
-            request.setValue(fetchInfo.urlRangeHeaderValue, forHTTPHeaderField: "Range")
             let key = FetchRangeKey(
                 hash: term.hash,
                 start: fetchInfo.range.lowerBound,
@@ -569,6 +558,7 @@ public final class XetDownloader: @unchecked Sendable {
                     fetchInfo: fetchInfo,
                     key: key,
                     request: request,
+                    fetchURLs: fetchURLs,
                     layout: layout
                 )
             )
@@ -588,6 +578,30 @@ public final class XetDownloader: @unchecked Sendable {
             throw XetDownloaderError.invalidReconstruction
         }
         return totalWritten
+    }
+
+    /// Gets a reconstruction of the file, or of `byteRange` of it,
+    /// with presigned URLs for its xorb fetches.
+    private func reconstruct(
+        _ fileID: String,
+        byteRange: Range<UInt64>?
+    ) async throws -> CASClient.ReconstructionResponse {
+        let conn = try await tokenProvider.connectionInfo(
+            for: refreshURL,
+            hubToken: hubToken
+        )
+        try Task.checkCancellation()
+        // Validate CAS URL uses HTTPS unless insecure connections are allowed
+        if !configuration.allowsInsecureConnections && conn.casURL.scheme != "https" {
+            throw XetDownloaderError.insecureURL(conn.casURL)
+        }
+
+        return try await casClient.reconstruction(
+            of: fileID,
+            casURL: conn.casURL,
+            accessToken: conn.accessToken,
+            byteRange: byteRange
+        )
     }
 
     /// Fetches each distinct range once and writes its chunks at their
@@ -645,7 +659,7 @@ public final class XetDownloader: @unchecked Sendable {
         try Task.checkCancellation()
         let firstChunkIndex = first.fetchInfo.range.lowerBound
         var decodedBytes = [Int](repeating: 0, count: contexts.count)
-        try await fetchXorbChunks(request: first.request) { ordinal, chunk in
+        try await fetchXorbChunks(first) { ordinal, chunk in
             let chunkIndex = firstChunkIndex + ordinal
             for (slot, context) in contexts.enumerated() where context.term.range.contains(chunkIndex) {
                 let layout = context.layout
@@ -801,7 +815,7 @@ public final class XetDownloader: @unchecked Sendable {
         var data = Data()
         data.reserveCapacity(expectedUnpackedLength)
         var chunkByteIndices: [Int] = [0]
-        try await fetchXorbChunks(request: context.request) { _, chunk in
+        try await fetchXorbChunks(context) { _, chunk in
             data.append(contentsOf: chunk)
             chunkByteIndices.append(data.count)
         }
@@ -818,20 +832,41 @@ public final class XetDownloader: @unchecked Sendable {
     /// A failed attempt that can be retried starts the fetch over.
     /// Chunks decode in the same order on every attempt,
     /// so a retry skips the chunks that `sink` already received.
+    /// Presigned URLs expire,
+    /// so an attempt refused with HTTP 403 is made again
+    /// with the URL and signed byte range from a new reconstruction, if that URL is different.
     ///
     /// The chunk buffer is only valid for the duration of the call.
     private func fetchXorbChunks(
-        request: URLRequest,
+        _ context: TermContext,
         sink: (_ ordinal: Int, _ chunk: UnsafeRawBufferPointer) throws -> Void
     ) async throws {
+        var request = context.request
         var deliveredChunks = 0
-        try await withRetries(configuration.retryPolicy, progress: { deliveredChunks }) {
+        func attempt(with fetch: FetchURLs.Fetch) async throws {
+            request.url = fetch.url
+            // A presigned URL authorizes only the byte range it was signed for.
+            request.setValue(fetch.fetchInfo.urlRangeHeaderValue, forHTTPHeaderField: "Range")
             try await fetchXorbChunksOnce(request: request) { ordinal, chunk in
                 guard ordinal >= deliveredChunks else {
                     return
                 }
                 try sink(ordinal, chunk)
                 deliveredChunks += 1
+            }
+        }
+        let range = context.fetchInfo.range
+        let hash = context.term.hash
+        try await withRetries(configuration.retryPolicy, progress: { deliveredChunks }) {
+            let fetch = try await context.fetchURLs.fetch(forRange: range, of: hash)
+            do {
+                try await attempt(with: fetch)
+            } catch let error as XetDownloaderError where error.statusCode == 403 {
+                let fresh = try await context.fetchURLs.fetch(forRange: range, of: hash, replacing: fetch.url)
+                guard let fresh else {
+                    throw error
+                }
+                try await attempt(with: fresh)
             }
         }
     }
@@ -985,6 +1020,7 @@ public final class XetDownloader: @unchecked Sendable {
         let fetchInfo: CASClient.ReconstructionResponse.FetchInfo
         let key: FetchRangeKey
         let request: URLRequest
+        let fetchURLs: FetchURLs
         let layout: TermLayout
     }
 
@@ -1701,6 +1737,73 @@ private struct FetchRangeKey: Hashable {
     let end: Int
     let urlRangeStart: UInt64
     let urlRangeEnd: UInt64
+}
+
+/// The presigned URLs of the xorb fetches of one download.
+///
+/// Like xet-core, a fetch refused with HTTP 403 asks for a new reconstruction,
+/// whose URLs replace those of every fetch.
+/// Fetches refused with the same URLs share it.
+private actor FetchURLs {
+    /// A presigned URL with the fetch info, including the byte range, it was signed for.
+    struct Fetch: Sendable {
+        let url: URL
+        let fetchInfo: CASClient.ReconstructionResponse.FetchInfo
+    }
+
+    private var reconstruction: CASClient.ReconstructionResponse
+    private var refresh: Task<Void, any Error>?
+    private let allowsInsecureConnections: Bool
+    private let reconstruct: @Sendable () async throws -> CASClient.ReconstructionResponse
+
+    init(
+        _ reconstruction: CASClient.ReconstructionResponse,
+        allowsInsecureConnections: Bool,
+        reconstruct: @escaping @Sendable () async throws -> CASClient.ReconstructionResponse
+    ) {
+        self.reconstruction = reconstruction
+        self.allowsInsecureConnections = allowsInsecureConnections
+        self.reconstruct = reconstruct
+    }
+
+    /// The fetch of `range` from the xorb `hash`.
+    func fetch(forRange range: Range<Int>, of hash: String) throws -> Fetch {
+        guard let fetchInfo = reconstruction.fetchInfo[hash]?.first(where: { $0.range == range }) else {
+            throw XetDownloaderError.invalidReconstruction
+        }
+        guard let url = URL(string: fetchInfo.url) else {
+            throw XetDownloaderError.invalidFetchURL(fetchInfo.url)
+        }
+        guard allowsInsecureConnections || url.scheme == "https" else {
+            throw XetDownloaderError.insecureURL(url)
+        }
+        return Fetch(url: url, fetchInfo: fetchInfo)
+    }
+
+    /// Returns a fetch to use in place of the one with the URL `refused`
+    /// for `range` from the xorb `hash`,
+    /// or `nil` if a new reconstruction has the same URL.
+    ///
+    /// The fetches of a download share one new reconstruction,
+    /// and canceling any of them cancels it.
+    func fetch(forRange range: Range<Int>, of hash: String, replacing refused: URL) async throws -> Fetch? {
+        if refresh == nil, try fetch(forRange: range, of: hash).url == refused {
+            // The task runs on this actor, so it can't finish before `refresh` is set.
+            refresh = Task {
+                defer { refresh = nil }
+                reconstruction = try await reconstruct()
+            }
+        }
+        if let refresh {
+            try await withTaskCancellationHandler {
+                try await refresh.value
+            } onCancel: {
+                refresh.cancel()
+            }
+        }
+        let fresh = try fetch(forRange: range, of: hash)
+        return fresh.url == refused ? nil : fresh
+    }
 }
 
 /// A fetched xorb chunk.
