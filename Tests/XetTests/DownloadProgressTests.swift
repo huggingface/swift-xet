@@ -460,11 +460,13 @@ struct DownloadProgressTests {
             let data = try await downloader.data(for: Self.fileID)
             #expect(data == xorb.output)
             #expect(requests.count(for: "/a") == 4)
+            // Each retry continued from the first chunk the previous attempt didn't deliver.
+            #expect(requests.sentChunks == xorb.chunks.count)
         }
     }
 
     @Test(arguments: [false, true])
-    func retryAfterDroppedStreamSkipsDeliveredChunks(writeToDisk: Bool) async throws {
+    func retryAfterDroppedStreamFetchesOnlyUndeliveredChunks(writeToDisk: Bool) async throws {
         let xorb = StreamedXorbFixture()
         try await withFixture(
             hashes: ["a"],
@@ -485,11 +487,50 @@ struct DownloadProgressTests {
 
             #expect(data == xorb.output)
             #expect(requests.count(for: "/a") == 2)
+            #expect(requests.sentChunks == xorb.chunks.count)
             let total = Int64(xorb.output.count)
             #expect(progress.values.allSatisfy { $0.total == total && $0.completed <= total })
             #expect(progress.values.map(\.completed) == progress.values.map(\.completed).sorted())
             #expect(progress.values.last == .init(completed: total, total: total))
             #expect(progress.values.filter { $0.completed == $0.total }.count == 1)
+        }
+    }
+
+    @Test func fetchContinuesWithARefreshedURLAfterItExpires() async throws {
+        // The first attempt drops after 40 chunks, its URL then expires,
+        // and the fetch continues with the new URL's signed range.
+        let xorb = StreamedXorbFixture()
+        try await withFixture(
+            hashes: ["a"],
+            unpackedLength: UInt32(xorb.output.count),
+            streamedXorb: xorb,
+            dropsStreamedXorbAfterChunks: [40],
+            expiresFetchURLsAfterFirstRequest: true
+        ) { downloader, requests in
+            let data = try await downloader.data(for: Self.fileID)
+            #expect(data == xorb.output)
+            #expect(requests.count(for: "/v2/reconstructions/\(Self.fileID)") == 2)
+            #expect(requests.count(for: "/a") == 3)
+            #expect(requests.sentChunks == xorb.chunks.count)
+        }
+    }
+
+    @Test func continuedFetchRequiresPartialContent() async throws {
+        // The retry asks for the rest of the range, but the server sends the whole xorb.
+        let xorb = StreamedXorbFixture()
+        try await withFixture(
+            hashes: ["a"],
+            unpackedLength: UInt32(xorb.output.count),
+            streamedXorb: xorb,
+            dropsStreamedXorbAfterChunks: [40],
+            ignoresRangeOnRetry: true
+        ) { downloader, requests in
+            let error = await downloaderError {
+                _ = try await downloader.data(for: Self.fileID)
+            }
+            #expect(error?.code == .fetchFailed)
+            #expect(error?.statusCode == 200)
+            #expect(requests.count(for: "/a") == 2)
         }
     }
 
@@ -720,6 +761,8 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
     private let delayB: TimeAmount
     private let streamedXorb: StreamedXorbFixture?
     private let dropsStreamedXorbAfterChunks: [Int]
+    private let ignoresRangeOnRetry: Bool
+    private let expiresFetchURLsAfterFirstRequest: Bool
     private let termRanges: [Range<Int>]?
     private let refusedFetchURLReconstructions: Int
     private let failingRefreshAttempts: Int
@@ -740,6 +783,8 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         delayB: TimeAmount,
         streamedXorb: StreamedXorbFixture?,
         dropsStreamedXorbAfterChunks: [Int],
+        ignoresRangeOnRetry: Bool,
+        expiresFetchURLsAfterFirstRequest: Bool,
         termRanges: [Range<Int>]?,
         refusedFetchURLReconstructions: Int,
         failingRefreshAttempts: Int,
@@ -759,6 +804,8 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         self.delayB = delayB
         self.streamedXorb = streamedXorb
         self.dropsStreamedXorbAfterChunks = dropsStreamedXorbAfterChunks
+        self.ignoresRangeOnRetry = ignoresRangeOnRetry
+        self.expiresFetchURLsAfterFirstRequest = expiresFetchURLsAfterFirstRequest
         self.termRanges = termRanges
         self.refusedFetchURLReconstructions = refusedFetchURLReconstructions
         self.failingRefreshAttempts = failingRefreshAttempts
@@ -784,8 +831,33 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         let path = String(request.uri.prefix { $0 != "?" })
         let attempt = requests.record(path)
         if path == "/a", let streamedXorb {
-            #expect(request.headers.first(name: "Range") == "bytes=0-\(streamedXorb.encodedByteCount - 1)")
-            send(streamedXorb, context: context, dropAfter: dropsStreamedXorbAfterChunks.dropFirst(attempt - 1).first)
+            let signing = signingReconstruction(of: request.uri)
+            if expiresFetchURLsAfterFirstRequest, attempt > 1, signing == 1 {
+                let head = HTTPResponseHead(
+                    version: .http1_1,
+                    status: .forbidden,
+                    headers: HTTPHeaders([("Content-Length", "0")])
+                )
+                context.write(NIOAny(HTTPServerResponsePart.head(head)), promise: nil)
+                context.writeAndFlush(NIOAny(HTTPServerResponsePart.end(nil)), promise: nil)
+                return
+            }
+            // A retry asks for the rest of the signed range, starting at a chunk boundary.
+            let signed = signedByteRange(forReconstruction: signing ?? 1)
+            let range = request.headers.first(name: "Range") ?? ""
+            let requestedStart = Int(range.dropFirst("bytes=".count).prefix { $0 != "-" }) ?? -1
+            let start = requestedStart - Int(signed.lowerBound)
+            let chunkLength = streamedXorb.encodedByteCount / streamedXorb.chunks.count
+            #expect(range.hasSuffix("-\(signed.upperBound)"))
+            #expect(start >= 0 && start % chunkLength == 0)
+            let ignoresRange = ignoresRangeOnRetry && attempt > 1
+            send(
+                streamedXorb,
+                from: ignoresRange ? 0 : max(0, start) / chunkLength,
+                status: ignoresRange ? .ok : .partialContent,
+                context: context,
+                dropAfter: dropsStreamedXorbAfterChunks.dropFirst(attempt - 1).first
+            )
             return
         }
         let base = "http://127.0.0.1:\(context.channel.localAddress!.port!)"
@@ -885,7 +957,12 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
     /// The query that signs the fetch URLs of a reconstruction,
     /// or nothing if no fetch URLs are refused.
     private func fetchURLSignature(forReconstruction attempt: Int) -> String {
-        refusedFetchURLReconstructions > 0 ? "?reconstruction=\(attempt)" : ""
+        signsFetchURLs ? "?reconstruction=\(attempt)" : ""
+    }
+
+    /// Whether fetch URLs carry the reconstruction that signed them.
+    private var signsFetchURLs: Bool {
+        refusedFetchURLReconstructions > 0 || expiresFetchURLsAfterFirstRequest
     }
 
     /// The byte range a reconstruction signs its fetch URLs for.
@@ -894,7 +971,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
     /// When fetch URLs are refused, each new reconstruction moves the range,
     /// so a fetch that keeps a stale `Range` header is refused too.
     private func signedByteRange(forReconstruction attempt: Int) -> ClosedRange<UInt64> {
-        let start = refusedFetchURLReconstructions > 0 ? UInt64(attempt - 1) * 100 : 0
+        let start = signsFetchURLs ? UInt64(attempt - 1) * 100 : 0
         return start ... start + UInt64((streamedXorb?.encodedByteCount ?? 12) - 1)
     }
 
@@ -908,24 +985,31 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         URLComponents(string: uri)?.queryItems?.first { $0.name == "reconstruction" }?.value.flatMap { Int($0) }
     }
 
-    /// Streams the xorb one chunk at a time.
+    /// Streams the xorb one chunk at a time, starting at chunk `first`.
     ///
-    /// If `dropAfter` is set, closes the connection after sending that many chunks.
-    private func send(_ xorb: StreamedXorbFixture, context: ChannelHandlerContext, dropAfter: Int? = nil) {
+    /// If `dropAfter` is set, closes the connection before sending the chunk at that index.
+    private func send(
+        _ xorb: StreamedXorbFixture,
+        from first: Int,
+        status: HTTPResponseStatus = .partialContent,
+        context: ChannelHandlerContext,
+        dropAfter: Int? = nil
+    ) {
+        let start = xorb.chunks[..<first].reduce(0) { $0 + $1.count }
         let head = HTTPResponseHead(
             version: .http1_1,
-            status: .partialContent,
+            status: status,
             headers: HTTPHeaders([
-                ("Content-Length", "\(xorb.encodedByteCount)"),
-                ("Content-Range", "bytes 0-\(xorb.encodedByteCount - 1)/\(xorb.encodedByteCount)"),
+                ("Content-Length", "\(xorb.encodedByteCount - start)"),
+                ("Content-Range", "bytes \(start)-\(xorb.encodedByteCount - 1)/\(xorb.encodedByteCount)"),
             ])
         )
         context.writeAndFlush(NIOAny(HTTPServerResponsePart.head(head)), promise: nil)
         let boundContext = NIOLoopBound(context, eventLoop: context.eventLoop)
         let requests = self.requests
-        for (index, chunk) in xorb.chunks.enumerated() {
+        for (index, chunk) in xorb.chunks.enumerated().dropFirst(first) {
             // Spread the response over more than six progress reporting intervals.
-            context.eventLoop.scheduleTask(in: .milliseconds(Int64(index) * 5)) {
+            context.eventLoop.scheduleTask(in: .milliseconds(Int64(index - first) * 5)) {
                 let context = boundContext.value
                 guard context.channel.isActive else { return }
                 if index == dropAfter {
@@ -959,6 +1043,8 @@ private func withFixture(
     delayB: TimeAmount = .nanoseconds(0),
     streamedXorb: StreamedXorbFixture? = nil,
     dropsStreamedXorbAfterChunks: [Int] = [],
+    ignoresRangeOnRetry: Bool = false,
+    expiresFetchURLsAfterFirstRequest: Bool = false,
     termRanges: [Range<Int>]? = nil,
     refusedFetchURLReconstructions: Int = 0,
     failingRefreshAttempts: Int = 0,
@@ -986,6 +1072,8 @@ private func withFixture(
                         delayB: delayB,
                         streamedXorb: streamedXorb,
                         dropsStreamedXorbAfterChunks: dropsStreamedXorbAfterChunks,
+                        ignoresRangeOnRetry: ignoresRangeOnRetry,
+                        expiresFetchURLsAfterFirstRequest: expiresFetchURLsAfterFirstRequest,
                         termRanges: termRanges,
                         refusedFetchURLReconstructions: refusedFetchURLReconstructions,
                         failingRefreshAttempts: failingRefreshAttempts,
