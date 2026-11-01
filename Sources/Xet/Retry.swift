@@ -32,17 +32,30 @@ struct RetryPolicy: Sendable {
 /// and runs it again after a wait each time it throws a retryable error,
 /// up to the policy's limit.
 ///
+/// An attempt that gets further than the one before it, as reported by `progress`,
+/// starts the count of retries and their waits over.
+///
 /// Errors that aren't retryable, including `CancellationError`, are thrown right away.
 /// Cancellation during a wait throws `CancellationError`.
 func withRetries<T>(
     _ policy: RetryPolicy,
+    progress: () -> Int = { 0 },
     _ operation: () async throws -> T
 ) async throws -> T {
     var retries = 0
+    var lastProgress = progress()
     while true {
         do {
             return try await operation()
-        } catch let error as XetDownloaderError where error.isRetryable && retries < policy.maxRetries {
+        } catch let error as XetDownloaderError where error.isRetryable {
+            let currentProgress = progress()
+            if currentProgress > lastProgress {
+                lastProgress = currentProgress
+                retries = 0
+            }
+            guard retries < policy.maxRetries else {
+                throw error
+            }
             retries += 1
             let delay = policy.delay(beforeRetry: retries)
             try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
