@@ -447,6 +447,22 @@ struct DownloadProgressTests {
         }
     }
 
+    @Test func fetchThatKeepsMakingProgressOutlastsTheRetryLimit() async throws {
+        // Each attempt receives more chunks before the connection drops,
+        // so the fetch takes 4 attempts, more than the fixture's 2 retries allow.
+        let xorb = StreamedXorbFixture()
+        try await withFixture(
+            hashes: ["a"],
+            unpackedLength: UInt32(xorb.output.count),
+            streamedXorb: xorb,
+            dropsStreamedXorbAfterChunks: [40, 80, 120]
+        ) { downloader, requests in
+            let data = try await downloader.data(for: Self.fileID)
+            #expect(data == xorb.output)
+            #expect(requests.count(for: "/a") == 4)
+        }
+    }
+
     @Test(arguments: [false, true])
     func retryAfterDroppedStreamSkipsDeliveredChunks(writeToDisk: Bool) async throws {
         let xorb = StreamedXorbFixture()
@@ -454,7 +470,7 @@ struct DownloadProgressTests {
             hashes: ["a"],
             unpackedLength: UInt32(xorb.output.count),
             streamedXorb: xorb,
-            dropsStreamedXorbAfterChunks: 40
+            dropsStreamedXorbAfterChunks: [40]
         ) { downloader, requests in
             let progress = ProgressRecorder()
             let data: Data
@@ -703,7 +719,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
     private let dropsXorbConnection: Bool
     private let delayB: TimeAmount
     private let streamedXorb: StreamedXorbFixture?
-    private let dropsStreamedXorbAfterChunks: Int?
+    private let dropsStreamedXorbAfterChunks: [Int]
     private let termRanges: [Range<Int>]?
     private let refusedFetchURLReconstructions: Int
     private let failingRefreshAttempts: Int
@@ -723,7 +739,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         dropsXorbConnection: Bool,
         delayB: TimeAmount,
         streamedXorb: StreamedXorbFixture?,
-        dropsStreamedXorbAfterChunks: Int?,
+        dropsStreamedXorbAfterChunks: [Int],
         termRanges: [Range<Int>]?,
         refusedFetchURLReconstructions: Int,
         failingRefreshAttempts: Int,
@@ -769,7 +785,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         let attempt = requests.record(path)
         if path == "/a", let streamedXorb {
             #expect(request.headers.first(name: "Range") == "bytes=0-\(streamedXorb.encodedByteCount - 1)")
-            send(streamedXorb, context: context, dropAfter: attempt == 1 ? dropsStreamedXorbAfterChunks : nil)
+            send(streamedXorb, context: context, dropAfter: dropsStreamedXorbAfterChunks.dropFirst(attempt - 1).first)
             return
         }
         let base = "http://127.0.0.1:\(context.channel.localAddress!.port!)"
@@ -942,7 +958,7 @@ private func withFixture(
     dropsXorbConnection: Bool = false,
     delayB: TimeAmount = .nanoseconds(0),
     streamedXorb: StreamedXorbFixture? = nil,
-    dropsStreamedXorbAfterChunks: Int? = nil,
+    dropsStreamedXorbAfterChunks: [Int] = [],
     termRanges: [Range<Int>]? = nil,
     refusedFetchURLReconstructions: Int = 0,
     failingRefreshAttempts: Int = 0,

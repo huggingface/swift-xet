@@ -67,6 +67,19 @@ struct RetryTests {
         #expect(attempts == 3)
     }
 
+    @Test func withRetriesStartsOverAfterProgress() async throws {
+        let policy = RetryPolicy(maxRetries: 1, baseDelay: 0)
+        var attempts = 0
+        await #expect(throws: XetDownloaderError.self) {
+            try await withRetries(policy, progress: { min(attempts, 2) }) {
+                attempts += 1
+                throw XetDownloaderError.fetchFailed(statusCode: 503, url: nil)
+            }
+        }
+        // Attempts 1 and 2 make progress, so each earns a retry; attempt 3 doesn't.
+        #expect(attempts == 3)
+    }
+
     @Test func withRetriesThrowsOtherErrorsRightAway() async throws {
         let policy = RetryPolicy(maxRetries: 2, baseDelay: 0)
         var attempts = 0
