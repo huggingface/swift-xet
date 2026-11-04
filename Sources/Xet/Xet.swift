@@ -829,9 +829,9 @@ public final class XetDownloader: @unchecked Sendable {
     /// Fetches one xorb range and hands each decoded chunk to `sink`
     /// with its ordinal within the range.
     ///
-    /// A failed attempt that can be retried starts the fetch over.
-    /// Chunks decode in the same order on every attempt,
-    /// so a retry skips the chunks that `sink` already received.
+    /// A failed attempt that can be retried continues the fetch
+    /// from the first chunk that `sink` hasn't received,
+    /// asking only for the rest of the signed byte range.
     /// Presigned URLs expire,
     /// so an attempt refused with HTTP 403 is made again
     /// with the URL and signed byte range from a new reconstruction, if that URL is different.
@@ -843,16 +843,27 @@ public final class XetDownloader: @unchecked Sendable {
     ) async throws {
         var request = context.request
         var deliveredChunks = 0
+        // Encoded bytes of the delivered chunks, from the start of the range.
+        var deliveredBytes: UInt64 = 0
         func attempt(with fetch: FetchURLs.Fetch) async throws {
+            // A presigned URL authorizes only the byte range it was signed for, or part of it.
+            let signed = fetch.fetchInfo.urlRange
+            let start = signed.lowerBound + deliveredBytes
+            guard start <= signed.upperBound else {
+                // Every chunk was delivered before the failure;
+                // the caller checks the decoded length.
+                return
+            }
             request.url = fetch.url
-            // A presigned URL authorizes only the byte range it was signed for.
-            request.setValue(fetch.fetchInfo.urlRangeHeaderValue, forHTTPHeaderField: "Range")
-            try await fetchXorbChunksOnce(request: request) { ordinal, chunk in
-                guard ordinal >= deliveredChunks else {
-                    return
-                }
-                try sink(ordinal, chunk)
+            request.setValue("bytes=\(start)-\(signed.upperBound)", forHTTPHeaderField: "Range")
+            let firstOrdinal = deliveredChunks
+            try await fetchXorbChunksOnce(request: request, continuing: firstOrdinal > 0) {
+                ordinal,
+                chunk,
+                encodedLength in
+                try sink(firstOrdinal + ordinal, chunk)
                 deliveredChunks += 1
+                deliveredBytes += UInt64(encodedLength)
             }
         }
         let range = context.fetchInfo.range
@@ -872,10 +883,15 @@ public final class XetDownloader: @unchecked Sendable {
     }
 
     /// Makes one attempt to fetch a xorb range,
-    /// handing each decoded chunk to `sink` with its ordinal within the range.
+    /// handing each decoded chunk to `sink` with its ordinal within the response
+    /// and its encoded length, header included.
+    ///
+    /// When `continuing`, the request asks for part of the signed range,
+    /// so only a partial content response starts at the requested chunk.
     private func fetchXorbChunksOnce(
         request: URLRequest,
-        sink: (_ ordinal: Int, _ chunk: UnsafeRawBufferPointer) throws -> Void
+        continuing: Bool = false,
+        sink: (_ ordinal: Int, _ chunk: UnsafeRawBufferPointer, _ encodedLength: Int) throws -> Void
     ) async throws {
         guard let url = request.url else {
             throw XetDownloaderError.fetchFailed(statusCode: nil, url: nil)
@@ -895,7 +911,7 @@ public final class XetDownloader: @unchecked Sendable {
             )
         }
         let statusCode = Int(response.status.code)
-        guard (200 ..< 300).contains(statusCode) || statusCode == 206 else {
+        guard (200 ..< 300).contains(statusCode) || statusCode == 206, !continuing || statusCode == 206 else {
             throw XetDownloaderError.fetchFailed(statusCode: statusCode, url: url)
         }
         let bufferSlots = max(
@@ -944,7 +960,7 @@ public final class XetDownloader: @unchecked Sendable {
     private func decodeXorbStream(
         stream: AsyncThrowingStream<ByteBuffer, Error>,
         bufferSemaphore: AsyncSemaphore,
-        sink: (_ ordinal: Int, _ chunk: UnsafeRawBufferPointer) throws -> Void
+        sink: (_ ordinal: Int, _ chunk: UnsafeRawBufferPointer, _ encodedLength: Int) throws -> Void
     ) async throws {
         var cursor = ByteCursor()
         var output = ScratchBuffer()
@@ -1005,7 +1021,7 @@ public final class XetDownloader: @unchecked Sendable {
                 }
                 cursor.consume(count: header.compressedLength)
 
-                try sink(ordinal, UnsafeRawBufferPointer(chunk))
+                try sink(ordinal, UnsafeRawBufferPointer(chunk), 8 + header.compressedLength)
                 ordinal += 1
             }
         }
