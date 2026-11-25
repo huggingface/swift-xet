@@ -855,9 +855,12 @@ public final class XetDownloader: @unchecked Sendable {
                 return
             }
             request.url = fetch.url
-            request.setValue("bytes=\(start)-\(signed.upperBound)", forHTTPHeaderField: "Range")
             let firstOrdinal = deliveredChunks
-            try await fetchXorbChunksOnce(request: request, continuing: firstOrdinal > 0) {
+            try await fetchXorbChunksOnce(
+                request: request,
+                byteRange: start ... signed.upperBound,
+                continuing: firstOrdinal > 0
+            ) {
                 ordinal,
                 chunk,
                 encodedLength in
@@ -890,7 +893,8 @@ public final class XetDownloader: @unchecked Sendable {
     /// so only a partial content response starts at the requested chunk.
     private func fetchXorbChunksOnce(
         request: URLRequest,
-        continuing: Bool = false,
+        byteRange: ClosedRange<UInt64>,
+        continuing: Bool,
         sink: (_ ordinal: Int, _ chunk: UnsafeRawBufferPointer, _ encodedLength: Int) throws -> Void
     ) async throws {
         guard let url = request.url else {
@@ -904,14 +908,38 @@ public final class XetDownloader: @unchecked Sendable {
                 httpRequest.headers.add(name: name, value: value)
             }
         }
+        httpRequest.headers.replaceOrAdd(name: "Range", value: "bytes=\(byteRange.lowerBound)-\(byteRange.upperBound)")
         let response = try await withTransportErrors(url: url) {
             try await client.execute(
                 httpRequest,
                 timeout: .seconds(Int64(max(1, configuration.readTimeout)))
             )
         }
+        try await decodeXorbResponse(
+            response,
+            url: url,
+            requestedStart: byteRange.lowerBound,
+            continuing: continuing,
+            sink: sink
+        )
+    }
+
+    /// Decodes one response to a request starting at an encoded byte offset in the xorb.
+    func decodeXorbResponse(
+        _ response: HTTPClientResponse,
+        url: URL,
+        requestedStart: UInt64,
+        continuing: Bool,
+        sink: (_ ordinal: Int, _ chunk: UnsafeRawBufferPointer, _ encodedLength: Int) throws -> Void
+    ) async throws {
         let statusCode = Int(response.status.code)
-        guard (200 ..< 300).contains(statusCode) || statusCode == 206, !continuing || statusCode == 206 else {
+        guard (200 ..< 300).contains(statusCode), !continuing || statusCode == 206 else {
+            throw XetDownloaderError.fetchFailed(statusCode: statusCode, url: url)
+        }
+        // The decoder assigns chunk ordinals relative to the first requested byte.
+        if statusCode == 206, let contentRange = response.headers.first(name: "Content-Range"),
+            let start = Self.firstBytePosition(in: contentRange), start != requestedStart
+        {
             throw XetDownloaderError.fetchFailed(statusCode: statusCode, url: url)
         }
         let bufferSlots = max(
@@ -951,6 +979,14 @@ public final class XetDownloader: @unchecked Sendable {
             try Task.checkCancellation()
             throw XetDownloaderError.invalidChunkData(error)
         }
+    }
+
+    private static func firstBytePosition(in contentRange: String) -> UInt64? {
+        let fields = contentRange.split(separator: " ", maxSplits: 1)
+        guard fields.count == 2, fields[0].lowercased() == "bytes",
+            let dash = fields[1].firstIndex(of: "-")
+        else { return nil }
+        return UInt64(fields[1][..<dash])
     }
 
     /// Decodes chunks from a xorb byte stream and hands each one to `sink`.
