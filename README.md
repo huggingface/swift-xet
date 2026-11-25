@@ -103,7 +103,9 @@ so a file reconstructed from one term reports only completion.
 
 A successful download reports equal completed and total counts,
 including `(0, 0)` for empty output.
-Disk downloads report completion after the file is closed.
+Disk downloads write to a temporary file in the destination directory.
+The downloader validates and closes the temporary file,
+then atomically renames it to the destination and reports completion.
 Failed or canceled downloads do not report completion.
 No callbacks occur after the method returns or throws.
 
