@@ -25,15 +25,23 @@ struct DownloadProgressTests {
         }
     }
 
-    @Test func diskDownloadCompletesAfterOutputIsAvailable() async throws {
+    @Test(arguments: [false, true])
+    func diskDownloadCompletesAfterOutputIsAvailable(existingFile: Bool) async throws {
         try await withFixture { downloader, requests in
-            let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-            defer { try? FileManager.default.removeItem(at: destination) }
+            let directory = try makeDownloadDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let destination = directory.appendingPathComponent("output")
+            let original = Data("previous download".utf8)
+            if existingFile { try original.write(to: destination) }
             let progress = ProgressRecorder()
             let written = try await downloader.download(Self.fileID, to: destination) { completed, total in
                 progress.record(completed, total)
                 if completed == total {
                     #expect((try? Data(contentsOf: destination)) == Data("aaaaBBBBaaaa".utf8))
+                } else if existingFile {
+                    #expect((try? Data(contentsOf: destination)) == original)
+                } else {
+                    #expect(!FileManager.default.fileExists(atPath: destination.path))
                 }
             }
 
@@ -118,6 +126,7 @@ struct DownloadProgressTests {
 
             let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: destination) }
+            try Data("previous download".utf8).write(to: destination)
             let written = try await downloader.download(
                 Self.fileID,
                 byteRange: 5 ..< 5,
@@ -276,6 +285,23 @@ struct DownloadProgressTests {
         }
     }
 
+    @Test func invalidDiskOutputPreservesDestination() async throws {
+        try await withFixture(unpackedLength: 8) { downloader, _ in
+            let directory = try makeDownloadDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let destination = directory.appendingPathComponent("output")
+            let original = Data("previous download".utf8)
+            try original.write(to: destination)
+
+            let error = await downloaderError {
+                try await downloader.download(Self.fileID, to: destination)
+            }
+            #expect(error?.code == .invalidReconstruction)
+            #expect(try Data(contentsOf: destination) == original)
+            #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path) == ["output"])
+        }
+    }
+
     @Test func rangeBeyondEndReportsActualOutputSize() async throws {
         try await withFixture { downloader, _ in
             let progress = ProgressRecorder()
@@ -412,11 +438,21 @@ struct DownloadProgressTests {
         }
     }
 
-    @Test func cancellationWhileWaitingForFetchDoesNotComplete() async throws {
+    @Test(arguments: [false, true])
+    func cancellationWhileWaitingForFetchDoesNotComplete(writeToDisk: Bool) async throws {
         try await withFixture(delayB: .seconds(2)) { downloader, requests in
+            let directory = try makeDownloadDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let destination = directory.appendingPathComponent("output")
+            let original = Data("previous download".utf8)
+            try original.write(to: destination)
             let progress = ProgressRecorder()
             let task = Task {
-                try await downloader.data(for: Self.fileID, progress: progress.record)
+                if writeToDisk {
+                    try await downloader.download(Self.fileID, to: destination, progress: progress.record)
+                } else {
+                    _ = try await downloader.data(for: Self.fileID, progress: progress.record)
+                }
             }
             defer { task.cancel() }
             let deadline = ContinuousClock.now.advanced(by: .seconds(5))
@@ -427,23 +463,51 @@ struct DownloadProgressTests {
             task.cancel()
             await #expect(throws: CancellationError.self) { try await task.value }
             #expect(progress.values == [.init(completed: 4, total: 12)])
+            #expect(try Data(contentsOf: destination) == original)
+            #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path) == ["output"])
         }
     }
 
-    @Test func diskFailureDoesNotComplete() async throws {
+    @Test(arguments: [false, true])
+    func diskFailureDoesNotComplete(existingFile: Bool) async throws {
         try await withFixture(failingBAttempts: 1, bFailureStatus: .forbidden) { downloader, _ in
-            let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-            defer { try? FileManager.default.removeItem(at: destination) }
+            let directory = try makeDownloadDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let destination = directory.appendingPathComponent("output")
+            let original = Data("previous download".utf8)
+            if existingFile { try original.write(to: destination) }
+
             let progress = ProgressRecorder()
             await #expect(throws: XetDownloaderError.self) {
                 try await downloader.download(Self.fileID, to: destination, progress: progress.record)
             }
             #expect(progress.values == [.init(completed: 4, total: 12)])
-            // The file holds the terms written before the failure and nothing from "b".
-            let data = try Data(contentsOf: destination)
-            #expect(data.prefix(4) == Data("aaaa".utf8))
-            #expect(data.count <= 12)
-            #expect(!data.contains(UInt8(ascii: "B")))
+            let files = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+            #expect(files == (existingFile ? ["output"] : []))
+            if existingFile {
+                #expect(try Data(contentsOf: destination) == original)
+            }
+        }
+    }
+
+    @Test func failedPublicationPreservesDirectory() async throws {
+        try await withFixture { downloader, _ in
+            let directory = try makeDownloadDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let destination = directory.appendingPathComponent("output")
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+            let progress = ProgressRecorder()
+            await #expect(throws: POSIXError.self) {
+                try await downloader.download(
+                    Self.fileID,
+                    byteRange: 0 ..< 0,
+                    to: destination,
+                    progress: progress.record
+                )
+            }
+            #expect(try FileManager.default.contentsOfDirectory(atPath: destination.path).isEmpty)
+            #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path) == ["output"])
+            #expect(progress.values.isEmpty)
         }
     }
 
@@ -451,14 +515,15 @@ struct DownloadProgressTests {
         // Each attempt receives more chunks before the connection drops,
         // so the fetch takes 4 attempts, more than the fixture's 2 retries allow.
         let xorb = StreamedXorbFixture()
-        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: destination) }
+        let directory = try makeDownloadDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("output")
         try await withFixture(
             hashes: ["a"],
             unpackedLength: UInt32(xorb.output.count),
             streamedXorb: xorb,
             dropsStreamedXorbAfterChunks: [40, 80, 120],
-            output: destination
+            outputDirectory: directory
         ) { downloader, requests in
             try await downloader.download(Self.fileID, to: destination)
             #expect(try Data(contentsOf: destination) == xorb.output)
@@ -471,14 +536,15 @@ struct DownloadProgressTests {
     @Test(arguments: [false, true])
     func retryAfterDroppedStreamFetchesOnlyUndeliveredChunks(writeToDisk: Bool) async throws {
         let xorb = StreamedXorbFixture()
-        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: destination) }
+        let directory = try makeDownloadDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("output")
         try await withFixture(
             hashes: ["a"],
             unpackedLength: UInt32(xorb.output.count),
             streamedXorb: xorb,
             dropsStreamedXorbAfterChunks: [40],
-            output: writeToDisk ? destination : nil
+            outputDirectory: writeToDisk ? directory : nil
         ) { downloader, requests in
             let progress = ProgressRecorder()
             let data: Data
@@ -508,14 +574,15 @@ struct DownloadProgressTests {
         // The first attempt drops after 40 chunks, its URL then expires,
         // and the fetch continues with the new URL's signed range.
         let xorb = StreamedXorbFixture()
-        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: destination) }
+        let directory = try makeDownloadDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("output")
         try await withFixture(
             hashes: ["a"],
             unpackedLength: UInt32(xorb.output.count),
             streamedXorb: xorb,
             dropsStreamedXorbAfterChunks: [40],
-            output: destination,
+            outputDirectory: directory,
             expiresFetchURLsAfterFirstRequest: true
         ) { downloader, requests in
             try await downloader.download(Self.fileID, to: destination)
@@ -529,14 +596,15 @@ struct DownloadProgressTests {
     @Test func continuedFetchRequiresPartialContent() async throws {
         // The retry asks for the rest of the range, but the server sends the whole xorb.
         let xorb = StreamedXorbFixture()
-        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: destination) }
+        let directory = try makeDownloadDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("output")
         try await withFixture(
             hashes: ["a"],
             unpackedLength: UInt32(xorb.output.count),
             streamedXorb: xorb,
             dropsStreamedXorbAfterChunks: [40],
-            output: destination,
+            outputDirectory: directory,
             ignoresRangeOnRetry: true
         ) { downloader, requests in
             let error = await downloaderError {
@@ -550,14 +618,15 @@ struct DownloadProgressTests {
 
     @Test func retryRangeStartsAfterTheEncodedBytesOfDeliveredChunks() async throws {
         let xorb = StreamedXorbFixture(compressedChunkLengths: [1_000, 5_000, 20_000, 3_000, 9_000, 2_000])
-        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: destination) }
+        let directory = try makeDownloadDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("output")
         try await withFixture(
             hashes: ["a"],
             unpackedLength: UInt32(xorb.output.count),
             streamedXorb: xorb,
             dropsStreamedXorbAfterChunks: [3],
-            output: destination,
+            outputDirectory: directory,
             // The retry delivers chunks of both terms.
             termRanges: [0 ..< 4, 4 ..< 6]
         ) { downloader, requests in
@@ -679,6 +748,12 @@ struct DownloadProgressTests {
             )
         }
     }
+}
+
+private func makeDownloadDirectory() throws -> URL {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+    return directory
 }
 
 private final class ProgressRecorder: @unchecked Sendable {
@@ -835,7 +910,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
     private let delayB: TimeAmount
     private let streamedXorb: StreamedXorbFixture?
     private let dropsStreamedXorbAfterChunks: [Int]
-    private let output: URL?
+    private let outputDirectory: URL?
     private let ignoresRangeOnRetry: Bool
     private let expiresFetchURLsAfterFirstRequest: Bool
     private let termRanges: [Range<Int>]?
@@ -858,7 +933,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         delayB: TimeAmount,
         streamedXorb: StreamedXorbFixture?,
         dropsStreamedXorbAfterChunks: [Int],
-        output: URL?,
+        outputDirectory: URL?,
         ignoresRangeOnRetry: Bool,
         expiresFetchURLsAfterFirstRequest: Bool,
         termRanges: [Range<Int>]?,
@@ -880,7 +955,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         self.delayB = delayB
         self.streamedXorb = streamedXorb
         self.dropsStreamedXorbAfterChunks = dropsStreamedXorbAfterChunks
-        self.output = output
+        self.outputDirectory = outputDirectory
         self.ignoresRangeOnRetry = ignoresRangeOnRetry
         self.expiresFetchURLsAfterFirstRequest = expiresFetchURLsAfterFirstRequest
         self.termRanges = termRanges
@@ -1090,7 +1165,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
         context.writeAndFlush(NIOAny(HTTPServerResponsePart.head(head)), promise: nil)
         let boundContext = NIOLoopBound(context, eventLoop: context.eventLoop)
         let requests = self.requests
-        let output = self.output
+        let outputDirectory = self.outputDirectory
         let dropped = NIOLoopBoundBox(false, eventLoop: context.eventLoop)
         for (index, chunk) in xorb.chunks.enumerated().dropFirst(first) {
             // Spread the response over more than six progress reporting intervals.
@@ -1100,7 +1175,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
                 if index == dropAfter {
                     dropped.value = true
                     let written = xorb.decodedLengths[..<index].reduce(0, +)
-                    closeConnection(boundContext, onceFile: output, holds: written)
+                    closeConnection(boundContext, onceOutputIn: outputDirectory, holds: written)
                     return
                 }
                 requests.recordChunk()
@@ -1116,23 +1191,27 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
     }
 }
 
-/// Closes a connection once `file` holds `length` bytes, or right away without a file.
-///
-/// The client writes a chunk to the file before it counts the chunk as delivered,
-/// so it can't lose the chunks in the file with the connection.
+/// Closes the connection after the client writes the expected bytes to its staging file.
+/// Each disk download has its own directory with a single file in it.
 private func closeConnection(
     _ context: NIOLoopBound<ChannelHandlerContext>,
-    onceFile file: URL?,
+    onceOutputIn directory: URL?,
     holds length: Int
 ) {
-    let attributes = file.flatMap { try? FileManager.default.attributesOfItem(atPath: $0.path) }
-    if file == nil || attributes?[.size] as? Int ?? 0 >= length {
-        context.value.close(promise: nil)
-    } else if context.value.channel.isActive {
-        context.value.eventLoop.scheduleTask(in: .milliseconds(1)) {
-            closeConnection(context, onceFile: file, holds: length)
+    if let directory {
+        let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.fileSizeKey]
+        )
+        let size = try? files?.first?.resourceValues(forKeys: [.fileSizeKey]).fileSize
+        if (size ?? 0) < length, context.value.channel.isActive {
+            context.value.eventLoop.scheduleTask(in: .milliseconds(1)) {
+                closeConnection(context, onceOutputIn: directory, holds: length)
+            }
+            return
         }
     }
+    context.value.close(promise: nil)
 }
 
 private func withFixture(
@@ -1149,7 +1228,7 @@ private func withFixture(
     delayB: TimeAmount = .nanoseconds(0),
     streamedXorb: StreamedXorbFixture? = nil,
     dropsStreamedXorbAfterChunks: [Int] = [],
-    output: URL? = nil,
+    outputDirectory: URL? = nil,
     ignoresRangeOnRetry: Bool = false,
     expiresFetchURLsAfterFirstRequest: Bool = false,
     termRanges: [Range<Int>]? = nil,
@@ -1179,7 +1258,7 @@ private func withFixture(
                         delayB: delayB,
                         streamedXorb: streamedXorb,
                         dropsStreamedXorbAfterChunks: dropsStreamedXorbAfterChunks,
-                        output: output,
+                        outputDirectory: outputDirectory,
                         ignoresRangeOnRetry: ignoresRangeOnRetry,
                         expiresFetchURLsAfterFirstRequest: expiresFetchURLsAfterFirstRequest,
                         termRanges: termRanges,

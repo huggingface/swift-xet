@@ -350,7 +350,8 @@ public final class XetDownloader: @unchecked Sendable {
     /// Chunks are written at their final offsets as they decode,
     /// so fetches for different parts of the file complete in any order
     /// and memory use is bounded by network buffers, not by file size.
-    /// If the download fails, the file may hold bytes from any part of the output.
+    /// The downloader writes to a temporary file in the destination directory.
+    /// It atomically replaces the destination after the download succeeds.
     ///
     /// Progress counts reconstructed bytes written to the output,
     /// not compressed network bytes.
@@ -367,7 +368,7 @@ public final class XetDownloader: @unchecked Sendable {
     ///
     /// On success, the final callback has equal completed and total counts,
     /// including `(0, 0)` for empty output.
-    /// For disk downloads, this occurs after the file is closed.
+    /// For disk downloads, this occurs after the file is available at the destination.
     /// Failure or cancellation produces no final update.
     /// No callbacks occur after the method returns or throws.
     /// Each new call starts its own count, including retries by the caller.
@@ -399,37 +400,36 @@ public final class XetDownloader: @unchecked Sendable {
         progress: (@Sendable (_ completedBytes: Int64, _ totalBytes: Int64) -> Void)? = nil
     ) async throws -> Int64 {
         try Task.checkCancellation()
-        if fileManager.fileExists(atPath: destinationURL.path) {
-            try fileManager.removeItem(at: destinationURL)
-        }
-        guard fileManager.createFile(atPath: destinationURL.path, contents: nil) else {
-            throw CocoaError(.fileWriteUnknown)
-        }
-
-        if let byteRange, byteRange.isEmpty {
-            try Task.checkCancellation()
-            progress?(0, 0)
-            return 0
-        }
-        let writer = try FileOutputWriter(destinationURL: destinationURL)
-        let target = WriteTarget.file(writer)
+        let stagingURL = destinationURL.deletingLastPathComponent()
+            .appendingPathComponent(".xet-\(UUID().uuidString)")
+        let writer = try FileOutputWriter(stagingURL: stagingURL)
         do {
-            let written = try await download(
-                fileID: fileID,
-                byteRange: byteRange,
-                target: target,
-                progress: progress
-            )
-            try await target.closeIfNeeded()
+            let written: Int64
+            if byteRange?.isEmpty == true {
+                written = 0
+            } else {
+                written = try await download(
+                    fileID: fileID,
+                    byteRange: byteRange,
+                    target: .file(writer),
+                    progress: progress
+                )
+            }
+            try await writer.close()
             try Task.checkCancellation()
+            guard rename(stagingURL.path, destinationURL.path) == 0 else {
+                throw POSIXError(POSIXError.Code(rawValue: errno) ?? .EIO)
+            }
             progress?(written, written)
             return written
         } catch {
-            await target.closeIfNeeded(catching: { closeError in
-                if let data = "Xet: failed to close file after download error: \(closeError)\n".data(using: .utf8) {
-                    FileHandle.standardError.write(data)
-                }
-            })
+            do {
+                try await writer.close()
+            } catch let closeError {
+                let message = "Xet: failed to close file after download error: \(closeError)\n"
+                FileHandle.standardError.write(Data(message.utf8))
+            }
+            try? fileManager.removeItem(at: stagingURL)
             throw error
         }
     }
@@ -1836,20 +1836,6 @@ private enum WriteTarget: Sendable {
 
     /// Receives chunks at their final offsets, in any order.
     case file(FileOutputWriter)
-
-    func closeIfNeeded() async throws {
-        if case .file(let writer) = self {
-            try await writer.close()
-        }
-    }
-
-    func closeIfNeeded(catching handler: (Error) -> Void) async {
-        do {
-            try await closeIfNeeded()
-        } catch {
-            handler(error)
-        }
-    }
 }
 
 /// An in-memory output writer that accumulates data.
@@ -1868,14 +1854,10 @@ final class FileOutputWriter: @unchecked Sendable {
     private let lock = NIOLock()
     private var fd: Int32
 
-    init(destinationURL: URL) throws {
-        let fm = FileManager.default
-        if fm.fileExists(atPath: destinationURL.path) {
-            try fm.removeItem(at: destinationURL)
-        }
-        let flags = O_CREAT | O_RDWR | O_TRUNC
+    init(stagingURL: URL) throws {
+        let flags = O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC
         let mode: mode_t = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH
-        let fd = open(destinationURL.path, flags, mode)
+        let fd = open(stagingURL.path, flags, mode)
         if fd < 0 {
             throw POSIXError(POSIXError.Code(rawValue: errno) ?? .EIO)
         }
