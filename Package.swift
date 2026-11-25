@@ -45,6 +45,7 @@ let package = Package(
             name: "XetTests",
             dependencies: [
                 "Xet",
+                .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOHTTP1", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),

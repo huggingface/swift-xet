@@ -1012,6 +1012,7 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
             send(
                 streamedXorb,
                 from: ignoresRange ? 0 : firstChunk,
+                signedRange: signed,
                 status: ignoresRange ? .ok : .partialContent,
                 context: context,
                 dropAfter: dropsStreamedXorbAfterChunks.dropFirst(attempt - 1).first
@@ -1149,17 +1150,19 @@ private final class FixtureHandler: ChannelInboundHandler, Sendable {
     private func send(
         _ xorb: StreamedXorbFixture,
         from first: Int,
+        signedRange: ClosedRange<UInt64>,
         status: HTTPResponseStatus = .partialContent,
         context: ChannelHandlerContext,
         dropAfter: Int? = nil
     ) {
         let start = xorb.chunks[..<first].reduce(0) { $0 + $1.count }
+        let firstByte = signedRange.lowerBound + UInt64(start)
         let head = HTTPResponseHead(
             version: .http1_1,
             status: status,
             headers: HTTPHeaders([
                 ("Content-Length", "\(xorb.encodedByteCount - start)"),
-                ("Content-Range", "bytes \(start)-\(xorb.encodedByteCount - 1)/\(xorb.encodedByteCount)"),
+                ("Content-Range", "bytes \(firstByte)-\(signedRange.upperBound)/*"),
             ])
         )
         context.writeAndFlush(NIOAny(HTTPServerResponsePart.head(head)), promise: nil)
